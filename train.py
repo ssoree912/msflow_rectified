@@ -17,9 +17,10 @@ from post_process import post_process
 from utils import Score_Observer, t2np, positionalencoding2d, save_weights, load_weights
 from evaluations import eval_det_loc
 
-
+#한 배치를 flow까지 통과시키는 학숨
 def model_forward(c, extractor, parallel_flows, fusion_flow, image):
-    h_list = extractor(image)
+    h_list = extractor(image) #고정으로 쓰는 백본, 특징 추출기
+    #논문에서 말하는 fearure pyramid를 pooling으로 정리 , stage 마다 조건으로 encoding을 넣고 parallel flow에 전달
     if c.pool_type == 'avg':
         pool_layer = nn.AvgPool2d(3, 2, 1)
     elif c.pool_type == 'max':
@@ -37,8 +38,8 @@ def model_forward(c, extractor, parallel_flows, fusion_flow, image):
         z_list.append(z)
         parallel_jac_list.append(jac)
 
-    z_list, fuse_jac = fusion_flow(z_list)
-    jac = fuse_jac + sum(parallel_jac_list)
+    z_list, fuse_jac = fusion_flow(z_list) #stage 별 z들을  fusion flow가 스케일간 상호작용
+    jac = fuse_jac + sum(parallel_jac_list) #전체 자코비안은 각 스테이지의 자코비안과 퓨전 플로우의 자코비안을 더한 것
 
     return z_list, jac
 
@@ -69,7 +70,7 @@ def train_meta_epoch(c, epoch, loader, extractor, parallel_flows, fusion_flow, p
                 z_list, jac = model_forward(c, extractor, parallel_flows, fusion_flow, image)
                 loss = 0.
                 for z in z_list:
-                    loss += 0.5 * torch.sum(z**2, (1, 2, 3))
+                    loss += 0.5 * torch.sum(z**2, (1, 2, 3)) #NLL loss : 0.5 * ||z||^2, 정상 데이터를 높은 loglikelihood로 만들도록 학습하는 구조
                 loss = loss - jac
                 loss = loss.mean()
                 loss.backward()
@@ -88,7 +89,6 @@ def train_meta_epoch(c, epoch, loader, extractor, parallel_flows, fusion_flow, p
             'Epoch {:d}.{:d} train loss: {:.3e}\tlr={:.2e}'.format(
                 epoch, sub_epoch, mean_epoch_loss, lr))
         
-
 def inference_meta_epoch(c, epoch, loader, extractor, parallel_flows, fusion_flow, vel_model=None, alpha_list=None):
     parallel_flows = [parallel_flow.eval() for parallel_flow in parallel_flows]
     fusion_flow = fusion_flow.eval()
@@ -112,7 +112,7 @@ def inference_meta_epoch(c, epoch, loader, extractor, parallel_flows, fusion_flo
             for lvl, z in enumerate(z_list):
                 if idx == 0:
                     size_list.append(list(z.shape[-2:]))
-                # Original logp map
+                # Original logp map,  stage 별 logp map 저장
                 logp = - 0.5 * torch.mean(z**2, 1)
                 outputs_list[lvl].append(logp)
 
