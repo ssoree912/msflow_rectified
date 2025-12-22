@@ -14,7 +14,7 @@ from models.extractors import build_extractor
 from models.flow_models import build_msflow_model
 from models.velocity import Velocity3Stage
 from post_process import post_process
-from utils import Score_Observer, t2np, positionalencoding2d, save_weights, load_weights
+from utils import Score_Observer, t2np, positionalencoding2d, save_weights, load_weights, infer_stage_hw
 from evaluations import eval_det_loc
 
 #한 배치를 flow까지 통과시키는 학숨
@@ -206,8 +206,9 @@ def train(c):
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=c.batch_size, shuffle=False, num_workers=c.workers, pin_memory=True)
 
     extractor, output_channels = build_extractor(c)
+    stage_hw = infer_stage_hw(c, extractor)
     extractor = extractor.to(c.device).eval()
-    parallel_flows, fusion_flow = build_msflow_model(c, output_channels)
+    parallel_flows, fusion_flow = build_msflow_model(c, output_channels, stage_hw)
     parallel_flows = [parallel_flow.to(c.device) for parallel_flow in parallel_flows]
     fusion_flow = fusion_flow.to(c.device)
     # if c.wandb_enable:

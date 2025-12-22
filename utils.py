@@ -4,6 +4,7 @@ import datetime
 
 import numpy as np
 import torch
+import torch.nn as nn
 
 def positionalencoding2d(D, H, W):
     """
@@ -25,6 +26,30 @@ def positionalencoding2d(D, H, W):
     P[D::2,  :, :]  = torch.sin(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, W)
     P[D+1::2,:, :]  = torch.cos(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, W)
     return P
+
+
+def infer_stage_hw(c, extractor):
+    """Compute per-stage spatial sizes after pooling for flow construction."""
+    was_training = extractor.training
+    extractor.eval()
+    device = next(extractor.parameters()).device
+    h, w = c.input_size
+    dummy = torch.zeros(1, 3, h, w, device=device)
+    with torch.no_grad():
+        feats = extractor(dummy)
+    if c.pool_type == 'avg':
+        pool_layer = nn.AvgPool2d(3, 2, 1)
+    elif c.pool_type == 'max':
+        pool_layer = nn.MaxPool2d(3, 2, 1)
+    else:
+        pool_layer = nn.Identity()
+    stage_hw = []
+    for feat in feats:
+        y = pool_layer(feat)
+        stage_hw.append((y.shape[-2], y.shape[-1]))
+    if was_training:
+        extractor.train()
+    return stage_hw
 
 
 def save_weights(epoch, parallel_flows, fusion_flow, model_name, ckpt_dir, optimizer=None):

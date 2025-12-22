@@ -33,28 +33,32 @@ class subnet_conv_ln(nn.Module):
 
         return out
 
-def single_parallel_flows(c_feat, c_cond, n_block, clamp_alpha, subnet=subnet_conv_ln):
-    flows = Ff.SequenceINN(c_feat, 1, 1)
-    print('Build parallel flows: channels:{}, block:{}, cond:{}'.format(c_feat, n_block, c_cond))
+def single_parallel_flows(c_feat, c_cond, n_block, clamp_alpha, spatial_hw, subnet=subnet_conv_ln):
+    h, w = spatial_hw
+    flows = Ff.SequenceINN(c_feat, h, w)
+    print('Build parallel flows: channels:{}, block:{}, cond:{}, size:{}x{}'.format(
+        c_feat, n_block, c_cond, h, w))
     for k in range(n_block):
-        flows.append(Fm.AllInOneBlock, cond=0, cond_shape=(c_cond, 1, 1), subnet_constructor=subnet, affine_clamping=clamp_alpha,
+        flows.append(Fm.AllInOneBlock, cond=0, cond_shape=(c_cond, h, w), subnet_constructor=subnet, affine_clamping=clamp_alpha,
             global_affine_type='SOFTPLUS')
     return flows
 
-def build_msflow_model(c, c_feats):
+def build_msflow_model(c, c_feats, stage_hw):
     c_conds = c.c_conds
     n_blocks = c.parallel_blocks
     clamp_alpha = c.clamp_alpha
+    if len(c_feats) != len(stage_hw):
+        raise ValueError(f"stage_hw length {len(stage_hw)} must match c_feats length {len(c_feats)}")
     parallel_flows = []
-    for c_feat, c_cond, n_block in zip(c_feats, c_conds, n_blocks):
+    for c_feat, c_cond, n_block, hw in zip(c_feats, c_conds, n_blocks, stage_hw):
         parallel_flows.append(
-            single_parallel_flows(c_feat, c_cond, n_block, clamp_alpha, subnet=subnet_conv_ln))
+            single_parallel_flows(c_feat, c_cond, n_block, clamp_alpha, hw, subnet=subnet_conv_ln))
     
     print("Build fusion flow with channels", c_feats)
     nodes = list()
     n_inputs = len(c_feats)
-    for idx, c_feat in enumerate(c_feats):
-        nodes.append(Ff.InputNode(c_feat, 1, 1, name='input{}'.format(idx)))
+    for idx, (c_feat, (h, w)) in enumerate(zip(c_feats, stage_hw)):
+        nodes.append(Ff.InputNode(c_feat, h, w, name='input{}'.format(idx)))
     for idx in range(n_inputs):
         nodes.append(Ff.Node(nodes[-n_inputs], Fm.PermuteRandom, {}, name='permute_{}'.format(idx)))
     nodes.append(Ff.Node([(nodes[-n_inputs+i], 0) for i in range(n_inputs)], FusionCouplingLayer, {'clamp': clamp_alpha}, name='fusion flow'))

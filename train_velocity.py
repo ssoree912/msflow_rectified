@@ -9,7 +9,7 @@ import default as cfg
 from datasets import MVTecDataset, VisADataset
 from models.extractors import build_extractor
 from models.flow_models import build_msflow_model
-from utils import positionalencoding2d, load_weights, save_weights, t2np
+from utils import positionalencoding2d, load_weights, save_weights, t2np, infer_stage_hw
 from pair_cutpaste_dataset import PairCutPasteMVTec, PairCutPasteVisA
 from models.velocity import Velocity3Stage
 from post_process import post_process
@@ -269,7 +269,8 @@ def main():
     extractor, c_list = build_extractor(cfg)  # pass default.py namespace
 
     # Build dummy flows and load saved MSFlow weights (aligns code & ensures no mismatch)
-    parallel_flows, fusion_flow = build_msflow_model(cfg, c_list)
+    stage_hw = infer_stage_hw(cfg, extractor)
+    parallel_flows, fusion_flow = build_msflow_model(cfg, c_list, stage_hw)
     # We'll load per-class inside the loop below.
 
     for k, v in vars(args).items():
