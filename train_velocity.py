@@ -33,7 +33,8 @@ def inference_with_velocity(c, test_loader, extractor, parallel_flows, fusion_fl
     # put models in eval
     parallel_flows = [pf.eval() for pf in parallel_flows]
     fusion_flow = fusion_flow.eval()
-    vel_model = vel_model.eval()
+    if vel_model is not None:
+        vel_model = vel_model.eval()
 
     gt_label_list = []
     gt_mask_list = []
@@ -110,18 +111,23 @@ def inference_with_velocity(c, test_loader, extractor, parallel_flows, fusion_fl
                     x3 = x3 + dt * d3 * alpha_list[2]
                 corrected_feats = (x1, x2, x3)
 
-                # now recompute logp for each corrected stage exactly like above
-                for lvl, (h_corr, flow, c_cond) in enumerate(zip(corrected_feats, parallel_flows, c.c_conds)):
+                # now recompute logp for corrected stages WITH fusion (match raw path)
+                z_corr_list = []
+                for (h_corr, flow, c_cond) in zip(corrected_feats, parallel_flows, c.c_conds):
                     y_corr = pool_layer(h_corr)
                     Bc, _, Hc, Wc = y_corr.shape
                     cond_corr = positionalencoding2d(c_cond, Hc, Wc).to(c.device).unsqueeze(0).repeat(Bc, 1, 1, 1)
                     z_corr, _ = flow(y_corr, [cond_corr])
-                    logp_corr = -0.5 * torch.mean(z_corr ** 2, 1)
+                    z_corr_list.append(z_corr)
 
-                    # original logp (same batch, same stage)
+                # z_list fusion -> 새로 추가 
+                z_corr_list, _ = fusion_flow(z_corr_list)
+
+                # compute logp_corr from fused corrected z, then diff
+                for lvl, z_corr in enumerate(z_corr_list):
+                    logp_corr = -0.5 * torch.mean(z_corr ** 2, 1)
                     logp_raw = outputs_list[lvl][-1]
                     diff = logp_raw - logp_corr
-                    # diff = logp_corr
                     outputs_list_diff[lvl].append(diff)
             else:
                 # keep shapes aligned
@@ -251,7 +257,7 @@ def main():
     parser.add_argument('--dataset', default='mvtec', type=str, choices=['mvtec', 'visa'], help='dataset')
     parser.add_argument('--class-names', default=['all'], type=str, nargs='+', help='class names')
     parser.add_argument('--batch-size', default=8, type=int, help='batch size')
-    parser.add_argument('--vel-epochs', default=100, type=int, help='epochs for velocity nets')
+    parser.add_argument('--vel-epochs', default=20, type=int, help='epochs for velocity nets')
     parser.add_argument('--vel-lr1', default=1e-4, type=float, help='lr for stage1 velocity')
     parser.add_argument('--vel-lr2', default=1e-4, type=float, help='lr for stage2 velocity')
     parser.add_argument('--vel-lr3', default=1e-4, type=float, help='lr for stage3 velocity')
