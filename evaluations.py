@@ -47,7 +47,7 @@ def eval_seg_pro(loc_pro_obs, epoch, gt_mask, anomaly_score_map, max_step=800):
     return loc_pro_auc, best
 
 def single_process(anomaly_score_map, gt_mask, thred):
-    binary_score_maps = np.zeros_like(anomaly_score_map, dtype=np.bool)
+    binary_score_maps = np.zeros_like(anomaly_score_map, dtype=bool)
     binary_score_maps[anomaly_score_map <= thred] = 0
     binary_score_maps[anomaly_score_map >  thred] = 1
     pro = []
@@ -65,8 +65,8 @@ def single_process(anomaly_score_map, gt_mask, thred):
 
 
 def eval_det_loc(det_auroc_obs, loc_auroc_obs, loc_pro_obs, epoch, gt_label_list, anomaly_score, gt_mask_list, anomaly_score_map_add, anomaly_score_map_mul, pro_eval):
-    gt_label = np.asarray(gt_label_list, dtype=np.bool)
-    gt_mask = np.squeeze(np.asarray(gt_mask_list, dtype=np.bool), axis=1)
+    gt_label = np.asarray(gt_label_list, dtype=bool)
+    gt_mask = np.squeeze(np.asarray(gt_mask_list, dtype=bool), axis=1)
     det_auroc, best_det_auroc = eval_det_auroc(det_auroc_obs, epoch, gt_label, anomaly_score)
     loc_auroc, best_loc_auroc = eval_loc_auroc(loc_auroc_obs, epoch, gt_mask, anomaly_score_map_add)
     if pro_eval:
