@@ -85,6 +85,29 @@ def compute_metrics(gt_label_list, gt_mask_list, anomaly_score, anomaly_score_ma
     return det_auroc, loc_auroc
 
 
+def anomaly_score_from_mulmap(cfg, anomaly_score_map_mul_np: np.ndarray) -> np.ndarray:
+    """Compute per-image anomaly score from (B,H,W) mul-map using top-k mean.
+
+    `post_process` uses: top_k = input_size[0]*input_size[1]*cfg.top_k.
+    We replicate the same behavior here so DET AUROC reflects the *final* (raw+diff) map.
+
+    Args:
+        cfg: config namespace with `input_size` and `top_k`
+        anomaly_score_map_mul_np: numpy array (B,H,W), larger means more anomalous
+
+    Returns:
+        numpy array of shape (B,) per-image anomaly scores.
+    """
+    B, H, W = anomaly_score_map_mul_np.shape
+    top_k = int(cfg.input_size[0] * cfg.input_size[1] * cfg.top_k)
+    top_k = max(1, min(top_k, H * W))
+
+    flat = anomaly_score_map_mul_np.reshape(B, -1)
+    # mean of top-k largest values (fast)
+    topk = np.partition(flat, -top_k, axis=1)[:, -top_k:]
+    return topk.mean(axis=1)
+
+
 def eval_msflow(cfg, ckpt_path, batch_size, num_workers):
     extractor, output_channels = build_extractor(cfg)
     stage_hw = infer_stage_hw(cfg, extractor)
@@ -149,11 +172,21 @@ def eval_velocity(cfg, msflow_ckpt, vel_ckpt, batch_size, num_workers):
     )
     fps = len(test_set) / (time.time() - start)
 
-    anomaly_score, anomaly_score_map_add, anomaly_score_map_mul = post_process(cfg, size_list, outputs_list)
+    # RAW (MSFlow) maps/scores
+    anomaly_score_raw, anomaly_score_map_add_raw, anomaly_score_map_mul_raw = post_process(cfg, size_list, outputs_list)
+
+    # DIFF (velocity) maps (score returned by post_process is ignored on purpose)
     _, anomaly_score_map_add_diff, anomaly_score_map_mul_diff = post_process(cfg, size_list, outputs_list_diff)
-    anomaly_score_map_add = anomaly_score_map_add + anomaly_score_map_add_diff
-    anomaly_score_map_mul = anomaly_score_map_mul + anomaly_score_map_mul_diff
-    det_auroc, loc_auroc = compute_metrics(gt_label_list, gt_mask_list, anomaly_score, anomaly_score_map_add)
+
+    # FINAL (raw + diff)
+    anomaly_score_map_add_final = anomaly_score_map_add_raw + anomaly_score_map_add_diff
+    anomaly_score_map_mul_final = anomaly_score_map_mul_raw + anomaly_score_map_mul_diff
+
+    # IMPORTANT: Make DET AUROC reflect velocity too by recomputing per-image anomaly_score
+    # from the FINAL mul-map using the same top-k mean rule as post_process.
+    anomaly_score_final = anomaly_score_from_mulmap(cfg, anomaly_score_map_mul_final)
+
+    det_auroc, loc_auroc = compute_metrics(gt_label_list, gt_mask_list, anomaly_score_final, anomaly_score_map_add_final)
     return det_auroc, loc_auroc, fps
 
 

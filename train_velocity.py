@@ -98,7 +98,11 @@ def inference_with_velocity(c, test_loader, extractor, parallel_flows, fusion_fl
                     logp_raw = -0.5 * torch.mean(z_raw ** 2, 1)
                     logp_corr = -0.5 * torch.mean(z_corr ** 2, 1)
                     outputs_list[lvl].append(logp_raw)
-                    outputs_list_diff[lvl].append(logp_raw - logp_corr)
+                    diff = logp_raw - logp_corr
+                    # post_process는 "클수록 정상(logp)" 
+                    # diff>0(교정 후 더 이상해짐)인 부분만 anomaly 신호로 쓰기 위해 음수로 페널티를 준다.
+                    pseudo_logp = -torch.relu(diff)  # diff<=0 -> 0, diff>0 -> negative
+                    outputs_list_diff[lvl].append(pseudo_logp)
             else:
                 # normal MSFlow forward: extractor -> per-stage flow -> fusion
                 z_list = []
@@ -223,6 +227,19 @@ def train_velocity_one_epoch(c, loader, extractor, vel_model, opt_list, alpha_li
 
     return loss_meter / max(1, count)
 
+def anomaly_score_from_mulmap(c, anomaly_score_map_mul_np: np.ndarray):
+    """
+    anomaly_score_map_mul_np: (B,H,W) numpy, 값이 클수록 이상.
+    post_process 내부처럼 top-k 평균으로 per-image anomaly score 산출.
+    """
+    B, H, W = anomaly_score_map_mul_np.shape
+    top_k = int(c.input_size[0] * c.input_size[1] * c.top_k)
+    top_k = max(1, min(top_k, H * W))
+    flat = anomaly_score_map_mul_np.reshape(B, -1)
+
+    # top-k largest mean (fast)
+    topk = np.partition(flat, -top_k, axis=1)[:, -top_k:]
+    return topk.mean(axis=1)
 
 def default_velocity_cfg(c_list):
     # Provide small defaults per stage (can be overridden by CLI)
@@ -350,35 +367,45 @@ def main():
                 scaler=scaler, amp=args.amp_enable, device=str(device)
             )
             print(f"... Epoch {ep} vel_loss={loss:.4f}")
-        
-            # ---- EVALUATE like train.py ----
+
+            # ---- EVALUATE (velocity 반영) ----
             gt_label_list, gt_mask_list, outputs_list, size_list, outputs_list_diff = \
-                inference_with_velocity(cfg, test_loader, extractor, parallel_flows, fusion_flow,
-                                        vel_model, [args.alpha1, args.alpha2, args.alpha3])
-        
-            # original msflow maps
-            anomaly_score, anomaly_score_map_add, anomaly_score_map_mul = \
+                inference_with_velocity(
+                    cfg, test_loader, extractor, parallel_flows, fusion_flow,
+                    vel_model, [args.alpha1, args.alpha2, args.alpha3]
+                )
+
+            # --- RAW (msflow) ---
+            anomaly_score_raw, anomaly_score_map_add_raw, anomaly_score_map_mul_raw = \
                 post_process(cfg, size_list, outputs_list)
-            # our stage-1 diff map → rescaled → add
-            _, anomaly_score_map_add_diff, anomaly_score_map_mul_diff = post_process(cfg, size_list, outputs_list_diff)
-            anomaly_score_map_add = anomaly_score_map_add + anomaly_score_map_add_diff
-            # anomaly_score_map_add = anomaly_score_map_add
-            anomaly_score_map_mul = anomaly_score_map_mul + anomaly_score_map_mul_diff
-        
+
+            # --- DIFF (velocity pseudo-logp) ---
+            _, anomaly_score_map_add_diff, anomaly_score_map_mul_diff = \
+                post_process(cfg, size_list, outputs_list_diff)
+
+            # --- FINAL (raw + diff) ---
+            anomaly_score_map_add_final = anomaly_score_map_add_raw + anomaly_score_map_add_diff
+            anomaly_score_map_mul_final = anomaly_score_map_mul_raw + anomaly_score_map_mul_diff
+
+            # DET도 velocity 반영: FINAL mul-map으로 anomaly_score 재계산
+            anomaly_score_final = anomaly_score_from_mulmap(cfg, anomaly_score_map_mul_final)
+
             # make score observers like train.py
             if ep == 0:
                 det_obs = Score_Observer('Det.AUROC', args.vel_epochs)
                 loc_obs = Score_Observer('Loc.AUROC', args.vel_epochs)
                 pro_obs = Score_Observer('Loc.PRO', args.vel_epochs)
-        
+
             det_auroc, loc_auroc, loc_pro_auc, \
                 best_det_flag, best_loc_flag, best_pro_flag = \
-                    eval_det_loc(det_obs, loc_obs, pro_obs, ep,
-                                 gt_label_list, anomaly_score,
-                                 gt_mask_list, anomaly_score_map_add,
-                                 anomaly_score_map_mul,
-                                 pro_eval = False)   # you can set True if you want PRO
-        
+                    eval_det_loc(
+                        det_obs, loc_obs, pro_obs, ep,
+                        gt_label_list, anomaly_score_final,
+                        gt_mask_list, anomaly_score_map_add_final,
+                        anomaly_score_map_mul_final,
+                        pro_eval=False
+                    )
+
             # ---- SAVE last (as before) ----
             state = {
                 'epoch': ep,
@@ -387,7 +414,7 @@ def main():
                 'cfg': vel_cfg,
             }
             torch.save(state, os.path.join(save_dir, "velocity_last.pt"))
-        
+
             # ---- SAVE best by Loc.AUROC ----
             if loc_auroc > best_loc_auroc:
                 best_loc_auroc = loc_auroc
