@@ -260,7 +260,7 @@ def main():
     parser.add_argument('--dataset', default='mvtec', type=str, choices=['mvtec', 'visa'], help='dataset')
     parser.add_argument('--class-names', default=['all'], type=str, nargs='+', help='class names')
     parser.add_argument('--batch-size', default=8, type=int, help='batch size')
-    parser.add_argument('--vel-epochs', default=20, type=int, help='epochs for velocity nets')
+    parser.add_argument('--vel-epochs', default=40, type=int, help='epochs for velocity nets')
     parser.add_argument('--vel-lr1', default=1e-4, type=float, help='lr for stage1 velocity')
     parser.add_argument('--vel-lr2', default=1e-4, type=float, help='lr for stage2 velocity')
     parser.add_argument('--vel-lr3', default=1e-4, type=float, help='lr for stage3 velocity')
@@ -358,6 +358,12 @@ def main():
         os.makedirs(save_dir, exist_ok=True)
 
         best_loc_auroc = 0.0
+        last_fps = None
+        best_det_fps = None
+        best_loc_fps = None
+        det_obs = None
+        loc_obs = None
+        pro_obs = None
         
         for ep in range(args.vel_epochs):
             loss = train_velocity_one_epoch(
@@ -369,11 +375,13 @@ def main():
             print(f"... Epoch {ep} vel_loss={loss:.4f}")
 
             # ---- EVALUATE (velocity 반영) ----
+            eval_start = time.time()
             gt_label_list, gt_mask_list, outputs_list, size_list, outputs_list_diff = \
                 inference_with_velocity(
                     cfg, test_loader, extractor, parallel_flows, fusion_flow,
                     vel_model, [args.alpha1, args.alpha2, args.alpha3]
                 )
+            last_fps = len(test_loader.dataset) / (time.time() - eval_start)
 
             # --- RAW (msflow) ---
             anomaly_score_raw, anomaly_score_map_add_raw, anomaly_score_map_mul_raw = \
@@ -405,6 +413,10 @@ def main():
                         anomaly_score_map_mul_final,
                         pro_eval=False
                     )
+            if best_det_flag:
+                best_det_fps = last_fps
+            if best_loc_flag:
+                best_loc_fps = last_fps
 
             # ---- SAVE last (as before) ----
             state = {
@@ -420,6 +432,23 @@ def main():
                 best_loc_auroc = loc_auroc
                 torch.save(state, os.path.join(save_dir, "velocity_best_loc.pt"))
                 print(f"[{cls}] New best Loc.AUROC: {loc_auroc:.2f}, saved velocity_best_loc.pt")
+
+        if det_obs is not None and loc_obs is not None and last_fps is not None:
+            if best_det_fps is None:
+                best_det_fps = last_fps
+            if best_loc_fps is None:
+                best_loc_fps = last_fps
+            out_path = os.path.join(save_dir, 'best_metrics.csv')
+            with open(out_path, 'w') as f:
+                f.write('dataset,class_name,best_det_auroc,best_det_epoch,best_det_fps,best_loc_auroc,best_loc_epoch,best_loc_fps\n')
+                f.write(
+                    f'{args.dataset},{cls},'
+                    f'{det_obs.max_score:.4f},{det_obs.max_epoch},'
+                    f'{best_det_fps:.4f},'
+                    f'{loc_obs.max_score:.4f},{loc_obs.max_epoch},'
+                    f'{best_loc_fps:.4f}\n'
+                )
+            print(f"Saved best metrics to {out_path}")
 
 if __name__ == "__main__":
     main()

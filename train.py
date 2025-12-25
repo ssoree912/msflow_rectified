@@ -226,12 +226,17 @@ def train(c):
     det_auroc_obs = Score_Observer('Det.AUROC', c.meta_epochs)
     loc_auroc_obs = Score_Observer('Loc.AUROC', c.meta_epochs)
     loc_pro_obs = Score_Observer('Loc.PRO', c.meta_epochs)
+    last_fps = None
+    best_det_fps = None
+    best_loc_fps = None
 
     start_epoch = 0
     if c.mode == 'test':
         start_epoch = load_weights(parallel_flows, fusion_flow, c.eval_ckpt)
         epoch = start_epoch + 1
+        eval_start = time.time()
         gt_label_list, gt_mask_list, outputs_list, size_list, outputs_list_diff = inference_meta_epoch(c, epoch, test_loader, extractor, parallel_flows, fusion_flow, vel_model if 'vel_model' in locals() else None, alpha_list if 'alpha_list' in locals() else None)
+        last_fps = len(test_loader.dataset) / (time.time() - eval_start)
 
         anomaly_score, anomaly_score_map_add, anomaly_score_map_mul = post_process(c, size_list, outputs_list)
         # New: process difference maps and sum for localization only
@@ -268,7 +273,9 @@ def train(c):
         print()
         train_meta_epoch(c, epoch, train_loader, extractor, parallel_flows, fusion_flow, params, optimizer, warmup_scheduler, decay_scheduler, scaler if c.amp_enable else None)
 
+        eval_start = time.time()
         gt_label_list, gt_mask_list, outputs_list, size_list, outputs_list_diff = inference_meta_epoch(c, epoch, test_loader, extractor, parallel_flows, fusion_flow, vel_model if 'vel_model' in locals() else None, alpha_list if 'alpha_list' in locals() else None)
+        last_fps = len(test_loader.dataset) / (time.time() - eval_start)
 
         anomaly_score, anomaly_score_map_add, anomaly_score_map_mul = post_process(c, size_list, outputs_list)
         anomaly_score_map_add = anomaly_score_map_add
@@ -281,6 +288,10 @@ def train(c):
         det_auroc, loc_auroc, loc_pro_auc, \
             best_det_auroc, best_loc_auroc, best_loc_pro = \
                 eval_det_loc(det_auroc_obs, loc_auroc_obs, loc_pro_obs, epoch, gt_label_list, anomaly_score, gt_mask_list, anomaly_score_map_add, anomaly_score_map_mul, pro_eval)
+        if best_det_auroc:
+            best_det_fps = last_fps
+        if best_loc_auroc:
+            best_loc_fps = last_fps
 
         if c.wandb_enable:
             wandb_run.log(
@@ -299,3 +310,20 @@ def train(c):
             save_weights(epoch, parallel_flows, fusion_flow, 'best_loc_auroc', c.ckpt_dir)
         if best_loc_pro and c.mode == 'train':
             save_weights(epoch, parallel_flows, fusion_flow, 'best_loc_pro', c.ckpt_dir)
+
+    if c.mode == 'train' and last_fps is not None:
+        if best_det_fps is None:
+            best_det_fps = last_fps
+        if best_loc_fps is None:
+            best_loc_fps = last_fps
+        out_path = os.path.join(c.ckpt_dir, 'best_metrics.csv')
+        with open(out_path, 'w') as f:
+            f.write('dataset,class_name,best_det_auroc,best_det_epoch,best_det_fps,best_loc_auroc,best_loc_epoch,best_loc_fps\n')
+            f.write(
+                f'{c.dataset},{c.class_name},'
+                f'{det_auroc_obs.max_score:.4f},{det_auroc_obs.max_epoch},'
+                f'{best_det_fps:.4f},'
+                f'{loc_auroc_obs.max_score:.4f},{loc_auroc_obs.max_epoch},'
+                f'{best_loc_fps:.4f}\n'
+            )
+        print(f"Saved best metrics to {out_path}")
