@@ -50,7 +50,7 @@ def inference_with_velocity(c, test_loader, extractor, parallel_flows, fusion_fl
             gt_mask_list.extend(t2np(mask))
 
             # ------------------------------------------------
-            # 1) feature extraction (shared by raw/velocity)
+            # 1) normal MSFlow forward: extractor -> per-stage flow -> fusion
             # ------------------------------------------------
             h_list = extractor(image)   # (x1,x2,x3) before pooling
             if c.pool_type == 'avg':
@@ -60,17 +60,30 @@ def inference_with_velocity(c, test_loader, extractor, parallel_flows, fusion_fl
             else:
                 pool_layer = nn.Identity()
 
+            z_list = []
+            for (h, flow, c_cond) in zip(h_list, parallel_flows, c.c_conds):
+                y = pool_layer(h)
+                B, _, H, W = y.shape
+                cond = positionalencoding2d(c_cond, H, W).to(c.device).unsqueeze(0).repeat(B, 1, 1, 1)
+                z, _ = flow(y, [cond])
+                z_list.append(z)
+
+            z_list, _ = fusion_flow(z_list)
+
+            for lvl, z in enumerate(z_list):
+                if idx == 0:
+                    size_list.append(list(z.shape[-2:]))
+                logp = -0.5 * torch.mean(z ** 2, 1)
+                outputs_list[lvl].append(logp)
+
             # ------------------------------------------------
-            # 2) velocity correction on ALL stages (concat raw+corr through flows)
+            # 2) velocity correction on ALL stages (no concat)
             # ------------------------------------------------
             if vel_model is not None and alpha_list is not None:
-                # start from original features
                 x1, x2, x3 = h_list
-                B = image.shape[0]
-                K = getattr(c, 'vel_steps', 1)         # e.g., 5~20
+                K = getattr(c, 'vel_steps', 1)
                 dt = 1.0 / K
                 for k in range(K):
-                    # time at the *current* state
                     t = torch.full((x1.size(0), 1), k * dt, device=x1.device)
                     d1, d2, d3 = vel_model((x1, x2, x3), t)
                     x1 = x1 + dt * d1 * alpha_list[0]
@@ -78,49 +91,17 @@ def inference_with_velocity(c, test_loader, extractor, parallel_flows, fusion_fl
                     x3 = x3 + dt * d3 * alpha_list[2]
                 corrected_feats = (x1, x2, x3)
 
-                z_cat_list = []
-                for (h_raw, h_corr, flow, c_cond) in zip(h_list, corrected_feats, parallel_flows, c.c_conds):
-                    y_raw = pool_layer(h_raw)
+                for lvl, (h_corr, flow, c_cond) in enumerate(zip(corrected_feats, parallel_flows, c.c_conds)):
                     y_corr = pool_layer(h_corr)
-                    _, _, H, W = y_raw.shape
-                    cond = positionalencoding2d(c_cond, H, W).to(c.device).unsqueeze(0).repeat(B, 1, 1, 1)
-                    y_cat = torch.cat([y_raw, y_corr], dim=0)
-                    cond_cat = torch.cat([cond, cond], dim=0)
-                    z_cat, _ = flow(y_cat, [cond_cat])
-                    z_cat_list.append(z_cat)
-
-                z_fused_cat_list, _ = fusion_flow(z_cat_list)
-
-                for lvl, z_fused_cat in enumerate(z_fused_cat_list):
-                    z_raw, z_corr = torch.split(z_fused_cat, B, dim=0)
-                    if idx == 0:
-                        size_list.append(list(z_raw.shape[-2:]))
-                    logp_raw = -0.5 * torch.mean(z_raw ** 2, 1)
+                    Bc, _, Hc, Wc = y_corr.shape
+                    cond_corr = positionalencoding2d(c_cond, Hc, Wc).to(c.device).unsqueeze(0).repeat(Bc, 1, 1, 1)
+                    z_corr, _ = flow(y_corr, [cond_corr])
                     logp_corr = -0.5 * torch.mean(z_corr ** 2, 1)
-                    outputs_list[lvl].append(logp_raw)
+
+                    logp_raw = outputs_list[lvl][-1]
                     diff = logp_raw - logp_corr
-                    # post_process는 "클수록 정상(logp)" 
-                    # diff>0(교정 후 더 이상해짐)인 부분만 anomaly 신호로 쓰기 위해 음수로 페널티를 준다.
-                    pseudo_logp = -torch.relu(diff)  # diff<=0 -> 0, diff>0 -> negative
-                    outputs_list_diff[lvl].append(pseudo_logp)
+                    outputs_list_diff[lvl].append(diff)
             else:
-                # normal MSFlow forward: extractor -> per-stage flow -> fusion
-                z_list = []
-                for (h, flow, c_cond) in zip(h_list, parallel_flows, c.c_conds):
-                    y = pool_layer(h)
-                    B, _, H, W = y.shape
-                    cond = positionalencoding2d(c_cond, H, W).to(c.device).unsqueeze(0).repeat(B, 1, 1, 1)
-                    z, _ = flow(y, [cond])
-                    z_list.append(z)
-
-                z_list, _ = fusion_flow(z_list)
-
-                for lvl, z in enumerate(z_list):
-                    if idx == 0:
-                        size_list.append(list(z.shape[-2:]))
-                    logp = -0.5 * torch.mean(z ** 2, 1)
-                    outputs_list[lvl].append(logp)
-
                 for lvl in range(len(parallel_flows)):
                     zeros = torch.zeros_like(outputs_list[lvl][-1])
                     outputs_list_diff[lvl].append(zeros)
