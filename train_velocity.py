@@ -77,7 +77,7 @@ def inference_with_velocity(c, test_loader, extractor, parallel_flows, fusion_fl
                 outputs_list[lvl].append(logp)
 
             # ------------------------------------------------
-            # 2) velocity correction on ALL stages (no concat)
+            # 2) velocity correction on ALL stages (with fusion)
             # ------------------------------------------------
             if vel_model is not None and alpha_list is not None:
                 x1, x2, x3 = h_list
@@ -91,11 +91,17 @@ def inference_with_velocity(c, test_loader, extractor, parallel_flows, fusion_fl
                     x3 = x3 + dt * d3 * alpha_list[2]
                 corrected_feats = (x1, x2, x3)
 
-                for lvl, (h_corr, flow, c_cond) in enumerate(zip(corrected_feats, parallel_flows, c.c_conds)):
+                z_corr_list = []
+                for (h_corr, flow, c_cond) in zip(corrected_feats, parallel_flows, c.c_conds):
                     y_corr = pool_layer(h_corr)
                     Bc, _, Hc, Wc = y_corr.shape
                     cond_corr = positionalencoding2d(c_cond, Hc, Wc).to(c.device).unsqueeze(0).repeat(Bc, 1, 1, 1)
                     z_corr, _ = flow(y_corr, [cond_corr])
+                    z_corr_list.append(z_corr)
+
+                z_corr_list, _ = fusion_flow(z_corr_list)
+
+                for lvl, z_corr in enumerate(z_corr_list):
                     logp_corr = -0.5 * torch.mean(z_corr ** 2, 1)
 
                     logp_raw = outputs_list[lvl][-1]
