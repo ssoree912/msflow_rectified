@@ -137,8 +137,7 @@ class MaskConv2d(nn.Conv2d):
         self.forward_type = None  # None => legacy, 문자열 모드면 DWA 사용
         self.alpha = 1.0
         self.beta = 1.0
-        self.threshold = Parameter(torch.tensor(0.05, dtype=self.weight.dtype, device=self.weight.device),
-                                   requires_grad=False)
+        self.threshold = Parameter(torch.tensor(0.05, dtype=self.weight.dtype), requires_grad=False)
 
     # 편의 메서드: DWA threshold 업데이트(가중치 절대값의 p-분위수)
     def update_threshold(self, percentile: int = 50):

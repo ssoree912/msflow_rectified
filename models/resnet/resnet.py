@@ -4,6 +4,8 @@ import torch.nn as nn
 from torch.utils.model_zoo import load_url as load_state_dict_from_url
 from typing import Type, Any, Callable, Union, List, Optional
 
+from pruning.mnn_dwa import MaskConv2d
+
 __all__ = ['ResNet', 'resnet18', 'resnet34', 'resnet50', 'resnet101',
            'resnet152', 'resnext50_32x4d', 'resnext101_32x8d',
            'wide_resnet50_2', 'wide_resnet101_2']
@@ -23,15 +25,27 @@ model_urls = {
 
 PADDING_MODE = 'reflect' # {'zeros', 'reflect', 'replicate', 'circular'}
 
-def conv3x3(in_planes: int, out_planes: int, stride: int = 1, groups: int = 1, dilation: int = 1) -> nn.Conv2d:
+def _is_dense(type_value: Optional[str]) -> bool:
+    return str(type_value).lower() == "dense"
+
+def conv3x3(in_planes: int, out_planes: int, stride: int = 1, groups: int = 1, dilation: int = 1) -> MaskConv2d:
     """3x3 convolution with padding"""
-    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride,
-                     padding=dilation, padding_mode = PADDING_MODE, groups=groups, bias=False, dilation=dilation)
+    return MaskConv2d(
+        in_planes,
+        out_planes,
+        kernel_size=3,
+        stride=stride,
+        padding=dilation,
+        padding_mode=PADDING_MODE,
+        groups=groups,
+        bias=False,
+        dilation=dilation,
+    )
 
 
-def conv1x1(in_planes: int, out_planes: int, stride: int = 1) -> nn.Conv2d:
+def conv1x1(in_planes: int, out_planes: int, stride: int = 1) -> MaskConv2d:
     """1x1 convolution"""
-    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
+    return MaskConv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
 
 
 class BasicBlock(nn.Module):
@@ -55,24 +69,30 @@ class BasicBlock(nn.Module):
             raise ValueError('BasicBlock only supports groups=1 and base_width=64')
         if dilation > 1:
             raise NotImplementedError("Dilation > 1 not supported in BasicBlock")
+        self.type_value = "sparse"
+
         # Both self.conv1 and self.downsample layers downsample the input when stride != 1
         self.conv1 = conv3x3(inplanes, planes, stride)
-        self.bn1 = norm_layer(planes)
+        self.bn1_part = norm_layer(planes)
+        self.bn1_full = norm_layer(planes)
         self.relu = nn.ReLU(inplace=True)
         self.conv2 = conv3x3(planes, planes)
-        self.bn2 = norm_layer(planes)
+        self.bn2_part = norm_layer(planes)
+        self.bn2_full = norm_layer(planes)
         self.downsample = downsample
         self.stride = stride
 
     def forward(self, x: Tensor) -> Tensor:
         identity = x
 
+        use_full = _is_dense(self.type_value)
+
         out = self.conv1(x)
-        out = self.bn1(out)
+        out = self.bn1_full(out) if use_full else self.bn1_part(out)
         out = self.relu(out)
 
         out = self.conv2(out)
-        out = self.bn2(out)
+        out = self.bn2_full(out) if use_full else self.bn2_part(out)
 
         if self.downsample is not None:
             identity = self.downsample(x)
@@ -108,12 +128,16 @@ class Bottleneck(nn.Module):
             norm_layer = nn.BatchNorm2d
         width = int(planes * (base_width / 64.)) * groups
         # Both self.conv2 and self.downsample layers downsample the input when stride != 1
+        self.type_value = "sparse"
         self.conv1 = conv1x1(inplanes, width)
-        self.bn1 = norm_layer(width)
+        self.bn1_part = norm_layer(width)
+        self.bn1_full = norm_layer(width)
         self.conv2 = conv3x3(width, width, stride, groups, dilation)
-        self.bn2 = norm_layer(width)
+        self.bn2_part = norm_layer(width)
+        self.bn2_full = norm_layer(width)
         self.conv3 = conv1x1(width, planes * self.expansion)
-        self.bn3 = norm_layer(planes * self.expansion)
+        self.bn3_part = norm_layer(planes * self.expansion)
+        self.bn3_full = norm_layer(planes * self.expansion)
         self.relu = nn.ReLU(inplace=True)
         self.downsample = downsample
         self.stride = stride
@@ -121,16 +145,18 @@ class Bottleneck(nn.Module):
     def forward(self, x: Tensor) -> Tensor:
         identity = x
 
+        use_full = _is_dense(self.type_value)
+
         out = self.conv1(x)
-        out = self.bn1(out)
+        out = self.bn1_full(out) if use_full else self.bn1_part(out)
         out = self.relu(out)
 
         out = self.conv2(out)
-        out = self.bn2(out)
+        out = self.bn2_full(out) if use_full else self.bn2_part(out)
         out = self.relu(out)
 
         out = self.conv3(out)
-        out = self.bn3(out)
+        out = self.bn3_full(out) if use_full else self.bn3_part(out)
 
         if self.downsample is not None:
             identity = self.downsample(x)
@@ -139,6 +165,22 @@ class Bottleneck(nn.Module):
         out = self.relu(out)
 
         return out
+
+
+class DownsampleDualBN(nn.Module):
+    def __init__(self, inplanes: int, outplanes: int, stride: int, norm_layer: Callable[..., nn.Module]) -> None:
+        super().__init__()
+        self.conv = conv1x1(inplanes, outplanes, stride)
+        self.bn_part = norm_layer(outplanes)
+        self.bn_full = norm_layer(outplanes)
+        self.type_value = "sparse"
+
+    #이중 BN, sparse/dense 모드에 따라 분기
+    def forward(self, x: Tensor) -> Tensor:
+        x = self.conv(x)
+        if _is_dense(self.type_value):
+            return self.bn_full(x)
+        return self.bn_part(x)
 
 
 class ResNet(nn.Module):
@@ -170,9 +212,17 @@ class ResNet(nn.Module):
                              "or a 3-element tuple, got {}".format(replace_stride_with_dilation))
         self.groups = groups
         self.base_width = width_per_group
-        self.conv1 = nn.Conv2d(3, self.inplanes, kernel_size=7, stride=2, padding=3, padding_mode = PADDING_MODE,
-                               bias=False)
-        self.bn1 = norm_layer(self.inplanes)
+        self.conv1 = MaskConv2d(
+            3,
+            self.inplanes,
+            kernel_size=7,
+            stride=2,
+            padding=3,
+            padding_mode=PADDING_MODE,
+            bias=False,
+        )
+        self.bn1_part = norm_layer(self.inplanes)
+        self.bn1_full = norm_layer(self.inplanes)
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         
@@ -182,9 +232,10 @@ class ResNet(nn.Module):
         # self.layer4 = self._make_layer(block, 512, layers[3], stride=2, dilate=replace_stride_with_dilation[2])
         #self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         #self.fc = nn.Linear(512 * block.expansion, num_classes)
+        self._control_state = None
 
         for m in self.modules():
-            if isinstance(m, nn.Conv2d):
+            if isinstance(m, MaskConv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
                 nn.init.constant_(m.weight, 1)
@@ -196,9 +247,11 @@ class ResNet(nn.Module):
         if zero_init_residual:
             for m in self.modules():
                 if isinstance(m, Bottleneck):
-                    nn.init.constant_(m.bn3.weight, 0)  # type: ignore[arg-type]
+                    nn.init.constant_(m.bn3_part.weight, 0)  # type: ignore[arg-type]
+                    nn.init.constant_(m.bn3_full.weight, 0)  # type: ignore[arg-type]
                 elif isinstance(m, BasicBlock):
-                    nn.init.constant_(m.bn2.weight, 0)  # type: ignore[arg-type]
+                    nn.init.constant_(m.bn2_part.weight, 0)  # type: ignore[arg-type]
+                    nn.init.constant_(m.bn2_full.weight, 0)  # type: ignore[arg-type]
 
     def _make_layer(self, block: Type[Union[BasicBlock, Bottleneck]], planes: int, blocks: int,
                     stride: int = 1, dilate: bool = False) -> nn.Sequential:
@@ -209,9 +262,7 @@ class ResNet(nn.Module):
             self.dilation *= stride
             stride = 1
         if stride != 1 or self.inplanes != planes * block.expansion:
-            downsample = nn.Sequential(
-                conv1x1(self.inplanes, planes * block.expansion, stride),
-                norm_layer(planes * block.expansion),)
+            downsample = DownsampleDualBN(self.inplanes, planes * block.expansion, stride, norm_layer)
 
         layers = []
         layers.append(block(self.inplanes, planes, stride, downsample, self.groups,
@@ -224,25 +275,80 @@ class ResNet(nn.Module):
 
         return nn.Sequential(*layers)
 
-    def _forward_impl(self, x: Tensor) -> Tensor:
+    def set_control(self, type_value: str = "sparse", forward_type: Optional[str] = None,
+                    alpha: float = 1.0, beta: float = 1.0,
+                    update_threshold: bool = False, threshold_percentile: int = 50) -> None:
+        for m in self.modules():
+            if isinstance(m, MaskConv2d):
+                m.type_value = type_value
+                m.forward_type = forward_type
+                m.alpha = alpha
+                m.beta = beta
+                if update_threshold:
+                    m.update_threshold(threshold_percentile)
+        for m in self.modules():
+            if isinstance(m, (BasicBlock, Bottleneck, DownsampleDualBN)):
+                m.type_value = type_value
+
+    def _forward_impl(self, x: Tensor, type_value: str = "sparse", forward_type: Optional[str] = None,
+                      alpha: float = 1.0, beta: float = 1.0,
+                      update_threshold: bool = False, threshold_percentile: int = 50) -> Tensor:
         # See note [TorchScript super()]
+        control_state = (type_value, forward_type, float(alpha), float(beta), int(threshold_percentile))
+        if update_threshold or control_state != self._control_state:
+            self.set_control(type_value, forward_type, alpha, beta, update_threshold, threshold_percentile)
+            self._control_state = control_state
+
         x = self.conv1(x)
-        x = self.bn1(x)
+        if _is_dense(type_value):
+            x = self.bn1_full(x)
+        else:
+            x = self.bn1_part(x)
         x = self.relu(x)
         x = self.maxpool(x)
 
         x1 = self.layer1(x)
         x2 = self.layer2(x1)
         x3 = self.layer3(x2)
-        # x = self.layer4(x)
-        # remove extra layers
-        #x = self.avgpool(x)
-        #x = torch.flatten(x, 1)
-        #x = self.fc(x)
         return [x1, x2, x3]
 
-    def forward(self, x: Tensor) -> Tensor:
-        return self._forward_impl(x)
+    def forward(self, x: Tensor, type_value: str = "sparse", forward_type: Optional[str] = None,
+                alpha: float = 1.0, beta: float = 1.0,
+                update_threshold: bool = False, threshold_percentile: int = 50) -> Tensor:
+        return self._forward_impl(x, type_value, forward_type, alpha, beta, update_threshold, threshold_percentile)
+
+
+def load_pretrained_torchvision_to_dualbn(model: nn.Module, tv_state: dict):
+    new_sd = {}
+    for k, v in tv_state.items():
+        if k.startswith("bn1."):
+            new_sd["bn1_part." + k[len("bn1."):]] = v
+            new_sd["bn1_full." + k[len("bn1."):]] = v
+            continue
+        if ".bn1." in k:
+            new_sd[k.replace(".bn1.", ".bn1_part.")] = v
+            new_sd[k.replace(".bn1.", ".bn1_full.")] = v
+            continue
+        if ".bn2." in k:
+            new_sd[k.replace(".bn2.", ".bn2_part.")] = v
+            new_sd[k.replace(".bn2.", ".bn2_full.")] = v
+            continue
+        if ".bn3." in k:
+            new_sd[k.replace(".bn3.", ".bn3_part.")] = v
+            new_sd[k.replace(".bn3.", ".bn3_full.")] = v
+            continue
+        if ".downsample.0." in k:
+            new_sd[k.replace(".downsample.0.", ".downsample.conv.")] = v
+            continue
+        if ".downsample.1." in k:
+            new_sd[k.replace(".downsample.1.", ".downsample.bn_part.")] = v
+            new_sd[k.replace(".downsample.1.", ".downsample.bn_full.")] = v
+            continue
+        new_sd[k] = v
+    missing, unexpected = model.load_state_dict(new_sd, strict=False)
+    if missing or unexpected:
+        print(f"[load_pretrained] missing keys: {missing[:20]}{' ...' if len(missing) > 20 else ''}")
+        print(f"[load_pretrained] unexpected keys: {unexpected[:20]}{' ...' if len(unexpected) > 20 else ''}")
 
 
 def _resnet(
@@ -256,8 +362,7 @@ def _resnet(
     model = ResNet(block, layers, **kwargs)
     if pretrained:
         state_dict = load_state_dict_from_url(model_urls[arch], progress=progress)
-        #model.load_state_dict(state_dict)
-        model.load_state_dict(state_dict, strict=False)
+        load_pretrained_torchvision_to_dualbn(model, state_dict)
     return model
 
 
