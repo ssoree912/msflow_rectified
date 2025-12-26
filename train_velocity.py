@@ -52,6 +52,7 @@ def inference_with_velocity(c, test_loader, extractor, parallel_flows, fusion_fl
             # ------------------------------------------------
             # 1) feature extraction (shared by raw/velocity)
             # ------------------------------------------------
+            # extract raw features (we'll reuse them for velocity)
             h_list = extractor(image)   # (x1,x2,x3) before pooling
             if c.pool_type == 'avg':
                 pool_layer = nn.AvgPool2d(3, 2, 1)
@@ -61,7 +62,7 @@ def inference_with_velocity(c, test_loader, extractor, parallel_flows, fusion_fl
                 pool_layer = nn.Identity()
 
             # ------------------------------------------------
-            # 2) velocity correction on ALL stages (concat raw+corr through flows)
+            # 2) velocity correction on ALL stages (concat raw+corr, no fusion)
             # ------------------------------------------------
             if vel_model is not None and alpha_list is not None:
                 # start from original features
@@ -78,8 +79,7 @@ def inference_with_velocity(c, test_loader, extractor, parallel_flows, fusion_fl
                     x3 = x3 + dt * d3 * alpha_list[2]
                 corrected_feats = (x1, x2, x3)
 
-                z_cat_list = []
-                for (h_raw, h_corr, flow, c_cond) in zip(h_list, corrected_feats, parallel_flows, c.c_conds):
+                for lvl, (h_raw, h_corr, flow, c_cond) in enumerate(zip(h_list, corrected_feats, parallel_flows, c.c_conds)):
                     y_raw = pool_layer(h_raw)
                     y_corr = pool_layer(h_corr)
                     _, _, H, W = y_raw.shape
@@ -87,12 +87,8 @@ def inference_with_velocity(c, test_loader, extractor, parallel_flows, fusion_fl
                     y_cat = torch.cat([y_raw, y_corr], dim=0)
                     cond_cat = torch.cat([cond, cond], dim=0)
                     z_cat, _ = flow(y_cat, [cond_cat])
-                    z_cat_list.append(z_cat)
 
-                z_fused_cat_list, _ = fusion_flow(z_cat_list)
-
-                for lvl, z_fused_cat in enumerate(z_fused_cat_list):
-                    z_raw, z_corr = torch.split(z_fused_cat, B, dim=0)
+                    z_raw, z_corr = torch.split(z_cat, B, dim=0)
                     if idx == 0:
                         size_list.append(list(z_raw.shape[-2:]))
                     logp_raw = -0.5 * torch.mean(z_raw ** 2, 1)

@@ -27,7 +27,7 @@ def positionalencoding2d(D, H, W):
     P[D+1::2,:, :]  = torch.cos(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, W)
     return P
 
-
+#  input data size 측정 후, stage별 pooling 후 spatial size 계산
 def infer_stage_hw(c, extractor):
     """Compute per-stage spatial sizes after pooling for flow construction."""
     was_training = extractor.training

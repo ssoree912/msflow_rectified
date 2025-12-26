@@ -2,16 +2,20 @@
 import argparse
 import csv
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+SOURCE_ROOT_COL = "source_root"
+SOURCE_PATH_COL = "source_path"
 
 
-def collect_csv_paths(root: Path, pattern: str) -> list[Path]:
+def collect_csv_paths(root: Path, pattern: str) -> List[Path]:
     return sorted((p for p in root.rglob(pattern) if p.is_file()), key=lambda p: str(p))
 
 
-def read_rows(paths: list[Path]) -> tuple[list[str] | None, list[dict]]:
+def read_rows(entries: List[Tuple[Path, Path]]) -> Tuple[Optional[List[str]], List[Dict[str, str]]]:
     header = None
     rows = []
-    for path in paths:
+    for path, root in entries:
         with path.open("r", newline="") as f:
             reader = csv.DictReader(f)
             if reader.fieldnames is None:
@@ -23,6 +27,8 @@ def read_rows(paths: list[Path]) -> tuple[list[str] | None, list[dict]]:
             for row in reader:
                 if not any(row.values()):
                     continue
+                row[SOURCE_ROOT_COL] = str(root)
+                row[SOURCE_PATH_COL] = str(path)
                 rows.append(row)
     return header, rows
 
@@ -39,15 +45,20 @@ def main():
         if not root.exists():
             raise SystemExit(f"Root path does not exist: {root}")
 
-    csv_paths = []
+    csv_entries: List[Tuple[Path, Path]] = []
     for root in roots:
-        csv_paths.extend(collect_csv_paths(root, args.pattern))
-    if not csv_paths:
+        for path in collect_csv_paths(root, args.pattern):
+            csv_entries.append((path, root))
+    if not csv_entries:
         raise SystemExit(f"No CSV files found under roots with pattern '{args.pattern}'")
 
-    header, rows = read_rows(csv_paths)
+    header, rows = read_rows(csv_entries)
     if header is None:
         raise SystemExit("No valid CSV headers found.")
+    out_header = list(header)
+    for extra in (SOURCE_ROOT_COL, SOURCE_PATH_COL):
+        if extra not in out_header:
+            out_header.append(extra)
 
     if args.out_csv:
         out_path = Path(args.out_csv).expanduser()
@@ -55,11 +66,11 @@ def main():
         out_path = roots[0] / "merged_metrics.csv" if len(roots) == 1 else Path("merged_metrics.csv")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=header)
+        writer = csv.DictWriter(f, fieldnames=out_header)
         writer.writeheader()
         writer.writerows(rows)
 
-    print(f"Saved {len(rows)} rows from {len(csv_paths)} files to {out_path}")
+    print(f"Saved {len(rows)} rows from {len(csv_entries)} files to {out_path}")
 
 
 if __name__ == "__main__":
