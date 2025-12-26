@@ -15,12 +15,14 @@ from models.velocity import Velocity3Stage
 from post_process import post_process
 from evaluations import eval_det_loc
 from utils import Score_Observer, positionalencoding2d, t2np
+from pruning.utils import apply_pruning_mask, extractor_forward, resolve_pruning_mode
+
 
 def model_forward_features(c, extractor, image):
     # Return the 3 pre-flow feature maps from extractor
     extractor = extractor.eval()
     with torch.no_grad():
-        feats = extractor(image)
+        feats = extractor_forward(c, extractor, image)
         # The provided resnet wrapper is expected to return [x1,x2,x3]
         if isinstance(feats, (list, tuple)):
             return feats[0], feats[1], feats[2]
@@ -52,7 +54,7 @@ def inference_with_velocity(c, test_loader, extractor, parallel_flows, fusion_fl
             # ------------------------------------------------
             # 1) normal MSFlow forward: extractor -> per-stage flow -> fusion
             # ------------------------------------------------
-            h_list = extractor(image)   # (x1,x2,x3) before pooling
+            h_list = extractor_forward(c, extractor, image)   # (x1,x2,x3) before pooling
             if c.pool_type == 'avg':
                 pool_layer = nn.AvgPool2d(3, 2, 1)
             elif c.pool_type == 'max':
@@ -170,8 +172,8 @@ def train_velocity_one_epoch(c, loader, extractor, vel_model, opt_list, alpha_li
 
         # frozen feature extractor
         with torch.no_grad():
-            xc1, xc2, xc3 = extractor(x_clean)  # "normal" features = z1
-            xa1, xa2, xa3 = extractor(x_abn)    # "abnormal" features = z0
+            xc1, xc2, xc3 = extractor_forward(c, extractor, x_clean)  # "normal" features = z1
+            xa1, xa2, xa3 = extractor_forward(c, extractor, x_abn)    # "abnormal" features = z0
 
         # sample t ~ U[0,1], broadcastable to feature maps
         t = torch.rand(B, 1, device=device)
@@ -250,21 +252,43 @@ def main():
     parser.add_argument('--alpha3', default=1.0, type=float, help='step factor for stage3')
     parser.add_argument('--save-root', default='./work_dirs/velocity_preflow', type=str, help='save dir root')
     parser.add_argument('--amp-enable', action='store_true', default=False, help='use torch.amp')
+    parser.add_argument(
+        '--pruning-mode',
+        default='dense',
+        choices=[
+            'dense',
+            'sparse',
+            'static',
+            'dynamic',
+            'reactivate_only',
+            'kill_only',
+            'kill_and_reactivate',
+        ],
+        help='pruning mode (legacy or DWA forward_type)',
+    )
+    parser.add_argument('--pruning-sparsity', type=float, default=0.0, help='global pruning sparsity [0,1]')
+    parser.add_argument('--dwa-alpha', type=float, default=1.0, help='DWA alpha')
+    parser.add_argument('--dwa-beta', type=float, default=1.0, help='DWA beta')
+    parser.add_argument('--dwa-update-threshold', action='store_true', default=False, help='update DWA threshold once')
+    parser.add_argument('--dwa-threshold-percentile', type=int, default=50, help='percentile for DWA threshold')
     args = parser.parse_args()
 
     # Honor defaults from default.py
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
-    # Build extractor + get stage channels
-    extractor, c_list = build_extractor(cfg)  # pass default.py namespace
-
-    # Build dummy flows and load saved MSFlow weights (aligns code & ensures no mismatch)
-    stage_hw = infer_stage_hw(cfg, extractor)
-    parallel_flows, fusion_flow = build_msflow_model(cfg, c_list, stage_hw)
-    # We'll load per-class inside the loop below.
-
     for k, v in vars(args).items():
         setattr(cfg, k, v)
+    cfg.device = device
+
+    pruning_type_value, pruning_forward_type = resolve_pruning_mode(args.pruning_mode)
+    cfg.pruning_mode = args.pruning_mode
+    cfg.pruning_type_value = pruning_type_value
+    cfg.pruning_forward_type = pruning_forward_type
+    cfg.pruning_sparsity = args.pruning_sparsity
+    cfg.dwa_alpha = args.dwa_alpha
+    cfg.dwa_beta = args.dwa_beta
+    cfg.dwa_update_threshold = args.dwa_update_threshold
+    cfg.dwa_threshold_percentile = args.dwa_threshold_percentile
     # Training for each class
         
     if cfg.dataset == 'mvtec':
@@ -280,6 +304,24 @@ def main():
 
         
     cfg.input_size = (256, 256) if cfg.class_name == 'transistor' else (512, 512)
+
+    # Build extractor + get stage channels
+    extractor, c_list = build_extractor(cfg)  # pass default.py namespace
+    if cfg.pruning_type_value == "dense":
+        applied_sparsity = apply_pruning_mask(extractor, 0.0)
+    else:
+        applied_sparsity = apply_pruning_mask(extractor, cfg.pruning_sparsity)
+    cfg.pruning_applied_sparsity = applied_sparsity
+    print(
+        f"[Pruning] mode={cfg.pruning_mode} "
+        f"(type_value={cfg.pruning_type_value}, forward_type={cfg.pruning_forward_type}), "
+        f"sparsity={cfg.pruning_sparsity:.4f}, applied={applied_sparsity:.4f}"
+    )
+
+    # Build dummy flows and load saved MSFlow weights (aligns code & ensures no mismatch)
+    stage_hw = infer_stage_hw(cfg, extractor)
+    parallel_flows, fusion_flow = build_msflow_model(cfg, c_list, stage_hw)
+    # We'll load per-class inside the loop below.
 
     extractor = extractor.to(device).eval()  # frozen backbone
     parallel_flows = [pf.to(device).eval() for pf in parallel_flows]
@@ -348,7 +390,7 @@ def main():
         
         for ep in range(args.vel_epochs):
             loss = train_velocity_one_epoch(
-                globals(), loader, extractor, vel_model,
+                cfg, loader, extractor, vel_model,
                 opt_list=[opt1,opt2,opt3],
                 alpha_list=[args.alpha1,args.alpha2,args.alpha3],
                 scaler=scaler, amp=args.amp_enable, device=str(device)
