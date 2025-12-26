@@ -16,10 +16,11 @@ from models.velocity import Velocity3Stage
 from post_process import post_process
 from utils import Score_Observer, t2np, positionalencoding2d, save_weights, load_weights, infer_stage_hw
 from evaluations import eval_det_loc
+from pruning.utils import resolve_pruning_mode, apply_pruning_mask, extractor_forward
 
 #한 배치를 flow까지 통과시키는 학숨
 def model_forward(c, extractor, parallel_flows, fusion_flow, image):
-    h_list = extractor(image) #고정으로 쓰는 백본, 특징 추출기
+    h_list = extractor_forward(c, extractor, image) #고정으로 쓰는 백본, 특징 추출기
     #논문에서 말하는 fearure pyramid를 pooling으로 정리 , stage 마다 조건으로 encoding을 넣고 parallel flow에 전달
     if c.pool_type == 'avg':
         pool_layer = nn.AvgPool2d(3, 2, 1)
@@ -168,6 +169,16 @@ def inference_meta_epoch(c, epoch, loader, extractor, parallel_flows, fusion_flo
 
 
 def train(c):
+    pruning_mode = getattr(c, 'pruning_mode', 'dense')
+    pruning_type_value, pruning_forward_type = resolve_pruning_mode(pruning_mode)
+    c.pruning_mode = pruning_mode
+    c.pruning_type_value = pruning_type_value
+    c.pruning_forward_type = pruning_forward_type
+    c.pruning_sparsity = getattr(c, 'pruning_sparsity', 0.0)
+    c.dwa_alpha = getattr(c, 'dwa_alpha', 1.0)
+    c.dwa_beta = getattr(c, 'dwa_beta', 1.0)
+    c.dwa_update_threshold = getattr(c, 'dwa_update_threshold', False)
+    c.dwa_threshold_percentile = getattr(c, 'dwa_threshold_percentile', 50)
     
     if c.wandb_enable:
         wandb.finish()
@@ -206,6 +217,16 @@ def train(c):
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=c.batch_size, shuffle=False, num_workers=c.workers, pin_memory=True)
 
     extractor, output_channels = build_extractor(c)
+    if c.pruning_type_value == "dense":
+        applied_sparsity = apply_pruning_mask(extractor, 0.0)
+    else:
+        applied_sparsity = apply_pruning_mask(extractor, c.pruning_sparsity)
+    c.pruning_applied_sparsity = applied_sparsity
+    print(
+        f"[Pruning] mode={c.pruning_mode} "
+        f"(type_value={c.pruning_type_value}, forward_type={c.pruning_forward_type}), "
+        f"sparsity={c.pruning_sparsity:.4f}, applied={applied_sparsity:.4f}"
+    )
     stage_hw = infer_stage_hw(c, extractor)
     extractor = extractor.to(c.device).eval()
     parallel_flows, fusion_flow = build_msflow_model(c, output_channels, stage_hw)

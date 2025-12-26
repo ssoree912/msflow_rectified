@@ -5,6 +5,23 @@ import torch
 from pruning.mnn_dwa import MaskConv2d
 
 
+def _compute_threshold(all_weights: torch.Tensor, sparsity: float) -> float:
+    if all_weights.numel() == 0:
+        return 0.0
+    if sparsity <= 0.0:
+        return float("-inf")
+    if sparsity >= 1.0:
+        return all_weights.max().item()
+
+    flat = all_weights.detach().flatten()
+    # kthvalue is CPU-safe for large tensors; do it once at startup.
+    flat_cpu = flat.cpu()
+    n = flat_cpu.numel()
+    k = int(sparsity * (n - 1)) + 1
+    k = max(1, min(k, n))
+    return flat_cpu.kthvalue(k).values.item()
+
+
 def resolve_pruning_mode(mode: Optional[str]) -> Tuple[str, Optional[str]]:
     mode = (mode or "dense").lower()
     legacy_modes = {"dense", "sparse", "static", "dynamic"}
@@ -34,10 +51,7 @@ def apply_pruning_mask(model, sparsity: float) -> float:
         return 0.0
     #가중치 절대값 모아서 threshold 계산. 전체 가중치 중 하위 몇 % 마스킹할지 결정
     all_weights = torch.cat(weights)
-    if sparsity >= 1.0:
-        threshold = all_weights.max()
-    else:
-        threshold = torch.quantile(all_weights, float(sparsity))
+    threshold = _compute_threshold(all_weights, float(sparsity))
 
     total_params = 0
     pruned_params = 0

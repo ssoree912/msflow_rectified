@@ -234,7 +234,8 @@ def default_velocity_cfg(c_list):
 
 def find_msflow_ckpt(cfg, dataset_name, class_name):
     # Example: work_dirs/msflow_wide_resnet50_2_avgpool_pl258/mvtec/bottle/best_loc_auroc.pt
-    model_dir = "msflow_wide_resnet50_2_avgpool_pl258"
+    # model_dir = "msflow_wide_resnet50_2_avgpool_pl258"
+    model_dir = "pruning/msflow_dwa"
     ckpt_path = os.path.join(cfg.work_dir, model_dir, dataset_name, class_name, "best_loc_auroc.pt")
     return ckpt_path
 

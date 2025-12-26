@@ -47,6 +47,25 @@ def parsing_args(c):
                         help='evaluate the pro score or not.')
     parser.add_argument('--pro-eval-interval', default=1, type=int, 
                         help='interval for pro evaluation.')
+    parser.add_argument(
+        '--pruning-mode',
+        default='dense',
+        choices=[
+            'dense',
+            'sparse',
+            'static',
+            'dynamic',
+            'reactivate_only',
+            'kill_only',
+            'kill_and_reactivate',
+        ],
+        help='pruning mode (legacy or DWA forward_type)',
+    )
+    parser.add_argument('--pruning-sparsity', type=float, default=0.0, help='global pruning sparsity [0,1]')
+    parser.add_argument('--dwa-alpha', type=float, default=1.0, help='DWA alpha')
+    parser.add_argument('--dwa-beta', type=float, default=1.0, help='DWA beta')
+    parser.add_argument('--dwa-update-threshold', action='store_true', default=False, help='update DWA threshold once')
+    parser.add_argument('--dwa-threshold-percentile', type=int, default=50, help='percentile for DWA threshold')
 
     args = parser.parse_args()
 

@@ -35,6 +35,14 @@ c_conds = [64, 64, 64]
 parallel_blocks = [2, 5, 8]
 clamp_alpha = 1.9
 
+# pruning (extractor)
+pruning_mode = 'dense'
+pruning_sparsity = 0.0
+dwa_alpha = 1.0
+dwa_beta = 1.0
+dwa_update_threshold = False
+dwa_threshold_percentile = 50
+
 # evaluation
 top_k = 0.03
 pro_eval = True
