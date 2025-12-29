@@ -47,6 +47,8 @@ def parsing_args(c):
                         help='evaluate the pro score or not.')
     parser.add_argument('--pro-eval-interval', default=1, type=int, 
                         help='interval for pro evaluation.')
+    parser.add_argument('--save-root', default=None, type=str,
+                        help='override root directory for checkpoints (default: work_dir)')
     parser.add_argument(
         '--pruning-mode',
         default='dense',
@@ -71,6 +73,9 @@ def parsing_args(c):
 
     for k, v in vars(args).items():
         setattr(c, k, v)
+
+    if c.save_root:
+        c.work_dir = c.save_root
     
     if c.dataset == 'mvtec':
         from datasets import MVTEC_CLASS_NAMES

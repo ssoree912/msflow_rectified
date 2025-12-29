@@ -62,26 +62,12 @@ def inference_with_velocity(c, test_loader, extractor, parallel_flows, fusion_fl
             else:
                 pool_layer = nn.Identity()
 
-            z_list = []
-            for (h, flow, c_cond) in zip(h_list, parallel_flows, c.c_conds):
-                y = pool_layer(h)
-                B, _, H, W = y.shape
-                cond = positionalencoding2d(c_cond, H, W).to(c.device).unsqueeze(0).repeat(B, 1, 1, 1)
-                z, _ = flow(y, [cond])
-                z_list.append(z)
-
-            z_list, _ = fusion_flow(z_list)
-
-            for lvl, z in enumerate(z_list):
-                if idx == 0:
-                    size_list.append(list(z.shape[-2:]))
-                logp = -0.5 * torch.mean(z ** 2, 1)
-                outputs_list[lvl].append(logp)
+            eval_mode = getattr(c, "vel_eval_mode", "raw_fusion_only")
 
             # ------------------------------------------------
-            # 2) velocity correction on ALL stages (no concat)
+            # 2) velocity correction + raw path selection
             # ------------------------------------------------
-            if vel_model is not None and alpha_list is not None:
+            if vel_model is not None and alpha_list is not None and eval_mode == "concat_fusion":
                 x1, x2, x3 = h_list
                 K = getattr(c, 'vel_steps', 1)
                 dt = 1.0 / K
@@ -93,20 +79,86 @@ def inference_with_velocity(c, test_loader, extractor, parallel_flows, fusion_fl
                     x3 = x3 + dt * d3 * alpha_list[2]
                 corrected_feats = (x1, x2, x3)
 
-                for lvl, (h_corr, flow, c_cond) in enumerate(zip(corrected_feats, parallel_flows, c.c_conds)):
+                z_raw_list = []
+                z_corr_list = []
+                for (h_raw, h_corr, flow, c_cond) in zip(h_list, corrected_feats, parallel_flows, c.c_conds):
+                    y_raw = pool_layer(h_raw)
                     y_corr = pool_layer(h_corr)
-                    Bc, _, Hc, Wc = y_corr.shape
-                    cond_corr = positionalencoding2d(c_cond, Hc, Wc).to(c.device).unsqueeze(0).repeat(Bc, 1, 1, 1)
-                    z_corr, _ = flow(y_corr, [cond_corr])
+                    y_cat = torch.cat([y_raw, y_corr], dim=0)
+                    Bc, _, Hc, Wc = y_cat.shape
+                    cond = positionalencoding2d(c_cond, Hc, Wc).to(c.device).unsqueeze(0).repeat(Bc, 1, 1, 1)
+                    z_cat, _ = flow(y_cat, [cond])
+                    z_raw, z_corr = torch.chunk(z_cat, 2, dim=0)
+                    z_raw_list.append(z_raw)
+                    z_corr_list.append(z_corr)
+                z_raw_list, _ = fusion_flow(z_raw_list)
+                z_corr_list, _ = fusion_flow(z_corr_list)
+                for lvl, (z_raw, z_corr) in enumerate(zip(z_raw_list, z_corr_list)):
+                    if idx == 0:
+                        size_list.append(list(z_raw.shape[-2:]))
+                    logp_raw = -0.5 * torch.mean(z_raw ** 2, 1)
                     logp_corr = -0.5 * torch.mean(z_corr ** 2, 1)
-
-                    logp_raw = outputs_list[lvl][-1]
+                    outputs_list[lvl].append(logp_raw)
                     diff = logp_raw - logp_corr
                     outputs_list_diff[lvl].append(diff)
             else:
-                for lvl in range(len(parallel_flows)):
-                    zeros = torch.zeros_like(outputs_list[lvl][-1])
-                    outputs_list_diff[lvl].append(zeros)
+                z_list = []
+                for (h, flow, c_cond) in zip(h_list, parallel_flows, c.c_conds):
+                    y = pool_layer(h)
+                    B, _, H, W = y.shape
+                    cond = positionalencoding2d(c_cond, H, W).to(c.device).unsqueeze(0).repeat(B, 1, 1, 1)
+                    z, _ = flow(y, [cond])
+                    z_list.append(z)
+
+                z_list, _ = fusion_flow(z_list)
+
+                for lvl, z in enumerate(z_list):
+                    if idx == 0:
+                        size_list.append(list(z.shape[-2:]))
+                    logp = -0.5 * torch.mean(z ** 2, 1)
+                    outputs_list[lvl].append(logp)
+
+                if vel_model is not None and alpha_list is not None:
+                    x1, x2, x3 = h_list
+                    K = getattr(c, 'vel_steps', 1)
+                    dt = 1.0 / K
+                    for k in range(K):
+                        t = torch.full((x1.size(0), 1), k * dt, device=x1.device)
+                        d1, d2, d3 = vel_model((x1, x2, x3), t)
+                        x1 = x1 + dt * d1 * alpha_list[0]
+                        x2 = x2 + dt * d2 * alpha_list[1]
+                        x3 = x3 + dt * d3 * alpha_list[2]
+                    corrected_feats = (x1, x2, x3)
+
+                    if eval_mode == "no_concat_fusion":
+                        z_corr_list = []
+                        for (h_corr, flow, c_cond) in zip(corrected_feats, parallel_flows, c.c_conds):
+                            y_corr = pool_layer(h_corr)
+                            Bc, _, Hc, Wc = y_corr.shape
+                            cond_corr = positionalencoding2d(c_cond, Hc, Wc).to(c.device).unsqueeze(0).repeat(Bc, 1, 1, 1)
+                            z_corr, _ = flow(y_corr, [cond_corr])
+                            z_corr_list.append(z_corr)
+                        z_corr_list, _ = fusion_flow(z_corr_list)
+                        for lvl, z_corr in enumerate(z_corr_list):
+                            logp_corr = -0.5 * torch.mean(z_corr ** 2, 1)
+                            logp_raw = outputs_list[lvl][-1]
+                            diff = logp_raw - logp_corr
+                            outputs_list_diff[lvl].append(diff)
+                    else:
+                        for lvl, (h_corr, flow, c_cond) in enumerate(zip(corrected_feats, parallel_flows, c.c_conds)):
+                            y_corr = pool_layer(h_corr)
+                            Bc, _, Hc, Wc = y_corr.shape
+                            cond_corr = positionalencoding2d(c_cond, Hc, Wc).to(c.device).unsqueeze(0).repeat(Bc, 1, 1, 1)
+                            z_corr, _ = flow(y_corr, [cond_corr])
+                            logp_corr = -0.5 * torch.mean(z_corr ** 2, 1)
+
+                            logp_raw = outputs_list[lvl][-1]
+                            diff = logp_raw - logp_corr
+                            outputs_list_diff[lvl].append(diff)
+                else:
+                    for lvl in range(len(parallel_flows)):
+                        zeros = torch.zeros_like(outputs_list[lvl][-1])
+                        outputs_list_diff[lvl].append(zeros)
 
     fps = len(test_loader.dataset) / (time.time() - start)
     print(datetime.datetime.now().strftime("[%Y-%m-%d-%H:%M:%S]"),
@@ -235,7 +287,7 @@ def default_velocity_cfg(c_list):
 def find_msflow_ckpt(cfg, dataset_name, class_name):
     # Example: work_dirs/msflow_wide_resnet50_2_avgpool_pl258/mvtec/bottle/best_loc_auroc.pt
     # model_dir = "msflow_wide_resnet50_2_avgpool_pl258"
-    model_dir = "pruning/msflow_dwa"
+    model_dir = "pruning/msflow/msflow_wide_resnet50_2_avgpool_pl258"
     ckpt_path = os.path.join(cfg.work_dir, model_dir, dataset_name, class_name, "best_loc_auroc.pt")
     return ckpt_path
 
@@ -253,6 +305,12 @@ def main():
     parser.add_argument('--alpha3', default=1.0, type=float, help='step factor for stage3')
     parser.add_argument('--save-root', default='./work_dirs/velocity_preflow', type=str, help='save dir root')
     parser.add_argument('--amp-enable', action='store_true', default=False, help='use torch.amp')
+    parser.add_argument(
+        '--vel-eval-mode',
+        default='raw_fusion_only',
+        choices=['raw_fusion_only', 'no_concat_fusion', 'concat_fusion'],
+        help='velocity eval mode: raw_fusion_only | no_concat_fusion | concat_fusion',
+    )
     parser.add_argument(
         '--pruning-mode',
         default='dense',
