@@ -17,6 +17,19 @@ from evaluations import eval_det_loc
 from utils import Score_Observer, positionalencoding2d, t2np
 from pruning.utils import apply_pruning_mask, extractor_forward, resolve_pruning_mode
 
+def _correct_stage3_only(c, vel_model, alpha_list, h_list):
+    raw_x1, raw_x2, raw_x3 = h_list
+    x3_corr = raw_x3.clone()
+    B = x3_corr.size(0)
+    K = getattr(c, 'vel_steps', 1)
+    dt = 1.0 / K
+    alpha3 = alpha_list[2]
+    for k in range(K):
+        t = torch.full((B, 1), k * dt, device=x3_corr.device)
+        d3 = vel_model.stage3(x3_corr, t)
+        x3_corr = x3_corr + dt * d3 * alpha3
+    return raw_x1, raw_x2, x3_corr
+
 
 def model_forward_features(c, extractor, image):
     # Return the 3 pre-flow feature maps from extractor
@@ -71,20 +84,7 @@ def inference_with_velocity(c, test_loader, extractor, parallel_flows, fusion_fl
              # === Mode 3: concat_fusion
              # =================================================================================
             if vel_model is not None and alpha_list is not None and eval_mode == "concat_fusion":
-                #원본 feature
-                x1, x2, x3 = h_list
-                K = getattr(c, 'vel_steps', 1)
-                dt = 1.0 / K
-                for k in range(K):
-                    #현재 상태의 시간 t
-                    t = torch.full((x1.size(0), 1), k * dt, device=x1.device)
-                    #3-stage velocity 예측
-                    d1, d2, d3 = vel_model((x1, x2, x3), t)
-                    #단계별로 velocity 적용
-                    x1 = x1 + dt * d1 * alpha_list[0]
-                    x2 = x2 + dt * d2 * alpha_list[1]
-                    x3 = x3 + dt * d3 * alpha_list[2]
-                corrected_feats = (x1, x2, x3)
+                corrected_feats = _correct_stage3_only(c, vel_model, alpha_list, h_list)
 
                 z_raw_list = []
                 z_corr_list = []
@@ -132,16 +132,7 @@ def inference_with_velocity(c, test_loader, extractor, parallel_flows, fusion_fl
                     outputs_list[lvl].append(logp)
 
                 if vel_model is not None and alpha_list is not None:
-                    x1, x2, x3 = h_list
-                    K = getattr(c, 'vel_steps', 1)
-                    dt = 1.0 / K
-                    for k in range(K):
-                        t = torch.full((x1.size(0), 1), k * dt, device=x1.device)
-                        d1, d2, d3 = vel_model((x1, x2, x3), t)
-                        x1 = x1 + dt * d1 * alpha_list[0]
-                        x2 = x2 + dt * d2 * alpha_list[1]
-                        x3 = x3 + dt * d3 * alpha_list[2]
-                    corrected_feats = (x1, x2, x3)
+                    corrected_feats = _correct_stage3_only(c, vel_model, alpha_list, h_list)
 
                      # =================================================================================
                      # === Mode 2: no_concat_fusion
