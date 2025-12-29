@@ -40,7 +40,7 @@ def inference_with_velocity(c, test_loader, extractor, parallel_flows, fusion_fl
 
     gt_label_list = []
     gt_mask_list = []
-    outputs_list = [list() for _ in parallel_flows]      # original msflow logp per stage
+    outputs_list = [list() for _ in parallel_flows]      # raw MsFlow의 logp 저장
     outputs_list_diff = [list() for _ in parallel_flows] # velocity-corrected diffs per stage
     size_list = []
 
@@ -67,13 +67,20 @@ def inference_with_velocity(c, test_loader, extractor, parallel_flows, fusion_fl
             # ------------------------------------------------
             # 2) velocity correction + raw path selection
             # ------------------------------------------------
+             # =================================================================================
+             # === Mode 3: concat_fusion
+             # =================================================================================
             if vel_model is not None and alpha_list is not None and eval_mode == "concat_fusion":
+                #원본 feature
                 x1, x2, x3 = h_list
                 K = getattr(c, 'vel_steps', 1)
                 dt = 1.0 / K
                 for k in range(K):
+                    #현재 상태의 시간 t
                     t = torch.full((x1.size(0), 1), k * dt, device=x1.device)
+                    #3-stage velocity 예측
                     d1, d2, d3 = vel_model((x1, x2, x3), t)
+                    #단계별로 velocity 적용
                     x1 = x1 + dt * d1 * alpha_list[0]
                     x2 = x2 + dt * d2 * alpha_list[1]
                     x3 = x3 + dt * d3 * alpha_list[2]
@@ -84,13 +91,16 @@ def inference_with_velocity(c, test_loader, extractor, parallel_flows, fusion_fl
                 for (h_raw, h_corr, flow, c_cond) in zip(h_list, corrected_feats, parallel_flows, c.c_conds):
                     y_raw = pool_layer(h_raw)
                     y_corr = pool_layer(h_corr)
+                    #concat 
                     y_cat = torch.cat([y_raw, y_corr], dim=0)
                     Bc, _, Hc, Wc = y_cat.shape
                     cond = positionalencoding2d(c_cond, Hc, Wc).to(c.device).unsqueeze(0).repeat(Bc, 1, 1, 1)
+                    #parallel flow 통과
                     z_cat, _ = flow(y_cat, [cond])
                     z_raw, z_corr = torch.chunk(z_cat, 2, dim=0)
                     z_raw_list.append(z_raw)
                     z_corr_list.append(z_corr)
+                #fusion flow 통과
                 z_raw_list, _ = fusion_flow(z_raw_list)
                 z_corr_list, _ = fusion_flow(z_corr_list)
                 for lvl, (z_raw, z_corr) in enumerate(zip(z_raw_list, z_corr_list)):
@@ -101,6 +111,9 @@ def inference_with_velocity(c, test_loader, extractor, parallel_flows, fusion_fl
                     outputs_list[lvl].append(logp_raw)
                     diff = logp_raw - logp_corr
                     outputs_list_diff[lvl].append(diff)
+                    # =================================================================================
+                    # === Mode 1 (raw_fusion_only) & Mode 2 (no_concat_fusion)
+                    # =================================================================================
             else:
                 z_list = []
                 for (h, flow, c_cond) in zip(h_list, parallel_flows, c.c_conds):
@@ -109,9 +122,9 @@ def inference_with_velocity(c, test_loader, extractor, parallel_flows, fusion_fl
                     cond = positionalencoding2d(c_cond, H, W).to(c.device).unsqueeze(0).repeat(B, 1, 1, 1)
                     z, _ = flow(y, [cond])
                     z_list.append(z)
-
+                #raw fusion
                 z_list, _ = fusion_flow(z_list)
-
+            
                 for lvl, z in enumerate(z_list):
                     if idx == 0:
                         size_list.append(list(z.shape[-2:]))
@@ -130,6 +143,9 @@ def inference_with_velocity(c, test_loader, extractor, parallel_flows, fusion_fl
                         x3 = x3 + dt * d3 * alpha_list[2]
                     corrected_feats = (x1, x2, x3)
 
+                     # =================================================================================
+                     # === Mode 2: no_concat_fusion
+                     # =================================================================================
                     if eval_mode == "no_concat_fusion":
                         z_corr_list = []
                         for (h_corr, flow, c_cond) in zip(corrected_feats, parallel_flows, c.c_conds):
@@ -144,12 +160,16 @@ def inference_with_velocity(c, test_loader, extractor, parallel_flows, fusion_fl
                             logp_raw = outputs_list[lvl][-1]
                             diff = logp_raw - logp_corr
                             outputs_list_diff[lvl].append(diff)
+                     # =================================================================================
+                     # === Mode 1: raw_fusion_only
+                     # =================================================================================
                     else:
                         for lvl, (h_corr, flow, c_cond) in enumerate(zip(corrected_feats, parallel_flows, c.c_conds)):
                             y_corr = pool_layer(h_corr)
                             Bc, _, Hc, Wc = y_corr.shape
                             cond_corr = positionalencoding2d(c_cond, Hc, Wc).to(c.device).unsqueeze(0).repeat(Bc, 1, 1, 1)
                             z_corr, _ = flow(y_corr, [cond_corr])
+                            #fusion flow 없이 logp 계산
                             logp_corr = -0.5 * torch.mean(z_corr ** 2, 1)
 
                             logp_raw = outputs_list[lvl][-1]
@@ -165,52 +185,6 @@ def inference_with_velocity(c, test_loader, extractor, parallel_flows, fusion_fl
           f"inference_with_velocity done. FPS: {fps:.1f}")
 
     return gt_label_list, gt_mask_list, outputs_list, size_list, outputs_list_diff
-
-# def train_velocity_one_epoch(c, loader, extractor, vel_model, opt_list, alpha_list, scaler=None, amp=False, device="cuda"):
-#     vel_model.train()
-#     loss_meter = 0.0
-#     count = 0
-#     l1 = nn.SmoothL1Loss()
-
-#     for (x_clean, x_abn, _, _) in loader:
-#         x_clean = x_clean.to(device, non_blocking=True)
-#         x_abn   = x_abn.to(device, non_blocking=True)
-
-#         # Get stage features
-#         with torch.no_grad():
-#             xc1, xc2, xc3 = extractor(x_clean)
-#             xa1, xa2, xa3 = extractor(x_abn)
-
-#         # Forward velocity nets
-#         opt1, opt2, opt3 = opt_list
-#         for opt in opt_list: opt.zero_grad(set_to_none=True)
-
-#         if amp and scaler:
-#             with torch.cuda.amp.autocast():
-#                 d1, d2, d3 = vel_model((xa1, xa2, xa3))
-#                 xa1_p = xa1 + alpha_list[0] * d1
-#                 xa2_p = xa2 + alpha_list[1] * d2
-#                 xa3_p = xa3 + alpha_list[2] * d3
-#                 loss = l1(xc1, xa1_p) + l1(xc2, xa2_p) + l1(xc3, xa3_p)
-#             scaler.scale(loss).backward()
-#             for opt in opt_list: scaler.step(opt)
-#             scaler.update()
-#         else:
-#             d1, d2, d3 = vel_model((xa1, xa2, xa3))
-#             xa1_p = xa1 + alpha_list[0] * d1
-#             xa2_p = xa2 + alpha_list[1] * d2
-#             xa3_p = xa3 + alpha_list[2] * d3
-#             loss = l1(xc1, xa1_p) + l1(xc2, xa2_p) + l1(xc3, xa3_p)
-#             loss.backward()
-#             for opt in opt_list: opt.step()
-
-#         bs = x_clean.shape[0]
-#         loss_meter += loss.item() * bs
-#         count += bs
-
-#     return loss_meter / max(1, count)
-
-# --- find train_velocity_one_epoch and replace its body with: ---
 
 def train_velocity_one_epoch(c, loader, extractor, vel_model, opt_list, alpha_list, scaler=None, amp=False, device="cuda"):
     vel_model.train()
