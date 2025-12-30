@@ -1,305 +1,74 @@
 #!/usr/bin/env python3
 import argparse
-import copy
-import time
+import csv
 from pathlib import Path
-from types import SimpleNamespace
-
-import numpy as np
-import torch
-from sklearn.metrics import roc_auc_score
-from torch.utils.data import DataLoader
-
-import default as default_cfg
-from datasets import MVTecDataset, VisADataset, MSTCDataset
-from datasets import MVTEC_CLASS_NAMES, VISA_CLASS_NAMES, MSTC_CLASS_NAMES
-from models.extractors import build_extractor
-from models.flow_models import build_msflow_model
-from models.velocity import Velocity3Stage
-from post_process import post_process
-from train import model_forward
-from train_velocity import inference_with_velocity, default_velocity_cfg
-from utils import infer_stage_hw, load_weights, t2np
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 
-def make_cfg():
-    keys = [
-        "extractor",
-        "pool_type",
-        "c_conds",
-        "parallel_blocks",
-        "clamp_alpha",
-        "img_mean",
-        "img_std",
-        "top_k",
-        "batch_size",
-        "workers",
-        "work_dir",
-    ]
-    cfg = SimpleNamespace()
-    for k in keys:
-        setattr(cfg, k, getattr(default_cfg, k))
-    return cfg
+def collect_csvs(roots: Sequence[Path], pattern: str) -> List[Tuple[Path, Path]]:
+    matches: List[Tuple[Path, Path]] = []
+    for root in roots:
+        if root.is_file():
+            matches.append((root.parent, root))
+            continue
+        for path in root.rglob(pattern):
+            if path.is_file():
+                matches.append((root, path))
+    return matches
 
 
-def set_dataset_cfg(cfg, dataset, class_name, data_path, device):
-    cfg.dataset = dataset
-    cfg.class_name = class_name
-    cfg.data_path = data_path
-    if dataset == "mvtec":
-        cfg.input_size = (256, 256) if class_name == "transistor" else (512, 512)
-    elif dataset == "mstc":
-        cfg.input_size = (256, 384)
-    else:
-        cfg.input_size = (512, 512)
-    cfg.device = device
+def read_rows(paths: Iterable[Tuple[Path, Path]]) -> Tuple[List[str], List[Dict[str, str]]]:
+    header: List[str] = []
+    rows: List[Dict[str, str]] = []
+    for root, path in paths:
+        with path.open(newline="") as f:
+            reader = csv.DictReader(f)
+            if reader.fieldnames:
+                for name in reader.fieldnames:
+                    if name not in header:
+                        header.append(name)
+            for row in reader:
+                row["source_root"] = str(root)
+                row["source_path"] = str(path)
+                rows.append(row)
+    for name in ("source_root", "source_path"):
+        if name not in header:
+            header.append(name)
+    return header, rows
 
 
-def get_class_names(dataset, class_names):
-    if class_names != ["all"]:
-        return class_names
-    if dataset == "mvtec":
-        return MVTEC_CLASS_NAMES
-    if dataset == "visa":
-        return VISA_CLASS_NAMES
-    if dataset == "mstc":
-        return MSTC_CLASS_NAMES
-    raise ValueError(f"Unknown dataset: {dataset}")
-
-
-def get_dataset(cfg, is_train=False):
-    if cfg.dataset == "mvtec":
-        return MVTecDataset(cfg, is_train=is_train)
-    if cfg.dataset == "visa":
-        return VisADataset(cfg, is_train=is_train)
-    if cfg.dataset == "mstc":
-        return MSTCDataset(cfg, is_train=is_train)
-    raise ValueError(f"Unknown dataset: {cfg.dataset}")
-
-
-def compute_metrics(gt_label_list, gt_mask_list, anomaly_score, anomaly_score_map_add):
-    gt_label = np.asarray(gt_label_list, dtype=bool)
-    gt_mask = np.squeeze(np.asarray(gt_mask_list, dtype=bool), axis=1)
-    det_auroc = roc_auc_score(gt_label, anomaly_score) * 100
-    loc_auroc = roc_auc_score(gt_mask.flatten(), anomaly_score_map_add.flatten()) * 100
-    return det_auroc, loc_auroc
-
-
-def anomaly_score_from_mulmap(cfg, anomaly_score_map_mul_np: np.ndarray) -> np.ndarray:
-    """Compute per-image anomaly score from (B,H,W) mul-map using top-k mean.
-
-    `post_process` uses: top_k = input_size[0]*input_size[1]*cfg.top_k.
-    We replicate the same behavior here so DET AUROC reflects the *final* (raw+diff) map.
-
-    Args:
-        cfg: config namespace with `input_size` and `top_k`
-        anomaly_score_map_mul_np: numpy array (B,H,W), larger means more anomalous
-
-    Returns:
-        numpy array of shape (B,) per-image anomaly scores.
-    """
-    B, H, W = anomaly_score_map_mul_np.shape
-    top_k = int(cfg.input_size[0] * cfg.input_size[1] * cfg.top_k)
-    top_k = max(1, min(top_k, H * W))
-
-    flat = anomaly_score_map_mul_np.reshape(B, -1)
-    # mean of top-k largest values (fast)
-    topk = np.partition(flat, -top_k, axis=1)[:, -top_k:]
-    return topk.mean(axis=1)
-
-
-def eval_msflow(cfg, ckpt_path, batch_size, num_workers):
-    extractor, output_channels = build_extractor(cfg)
-    stage_hw = infer_stage_hw(cfg, extractor)
-    parallel_flows, fusion_flow = build_msflow_model(cfg, output_channels, stage_hw)
-
-    load_weights(parallel_flows, fusion_flow, ckpt_path)
-
-    device = cfg.device
-    extractor = extractor.to(device).eval()
-    parallel_flows = [pf.to(device).eval() for pf in parallel_flows]
-    fusion_flow = fusion_flow.to(device).eval()
-
-    test_set = get_dataset(cfg, is_train=False)
-    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
-
-    outputs_list = [list() for _ in parallel_flows]
-    size_list = []
-    gt_label_list, gt_mask_list = [], []
-    start = time.time()
-    with torch.no_grad():
-        for idx, (image, label, mask) in enumerate(test_loader):
-            image = image.to(device)
-            gt_label_list.extend(t2np(label))
-            gt_mask_list.extend(t2np(mask))
-            z_list, _ = model_forward(cfg, extractor, parallel_flows, fusion_flow, image)
-            for lvl, z in enumerate(z_list):
-                if idx == 0:
-                    size_list.append(list(z.shape[-2:]))
-                logp = -0.5 * torch.mean(z ** 2, 1)
-                outputs_list[lvl].append(logp)
-
-    fps = len(test_set) / (time.time() - start)
-    anomaly_score, anomaly_score_map_add, _ = post_process(cfg, size_list, outputs_list)
-    det_auroc, loc_auroc = compute_metrics(gt_label_list, gt_mask_list, anomaly_score, anomaly_score_map_add)
-    return det_auroc, loc_auroc, fps
-
-
-def eval_velocity(cfg, msflow_ckpt, vel_ckpt, batch_size, num_workers):
-    extractor, c_list = build_extractor(cfg)
-    stage_hw = infer_stage_hw(cfg, extractor)
-    parallel_flows, fusion_flow = build_msflow_model(cfg, c_list, stage_hw)
-
-    load_weights(parallel_flows, fusion_flow, msflow_ckpt)
-
-    device = cfg.device
-    extractor = extractor.to(device).eval()
-    parallel_flows = [pf.to(device).eval() for pf in parallel_flows]
-    fusion_flow = fusion_flow.to(device).eval()
-
-    state = torch.load(vel_ckpt, map_location=device)
-    vel_cfg = state.get("cfg", default_velocity_cfg(c_list))
-    vel_model = Velocity3Stage(c_list, vel_cfg).to(device)
-    vel_model.load_state_dict(state["model"])
-    alpha_list = state.get("alpha", [1.0, 1.0, 1.0])
-
-    test_set = get_dataset(cfg, is_train=False)
-    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=True)
-
-    start = time.time()
-    gt_label_list, gt_mask_list, outputs_list, size_list, outputs_list_diff = inference_with_velocity(
-        cfg, test_loader, extractor, parallel_flows, fusion_flow, vel_model, alpha_list
-    )
-    fps = len(test_set) / (time.time() - start)
-
-    # RAW (MSFlow) maps/scores
-    anomaly_score_raw, anomaly_score_map_add_raw, anomaly_score_map_mul_raw = post_process(cfg, size_list, outputs_list)
-
-    # DIFF (velocity) maps (score returned by post_process is ignored on purpose)
-    _, anomaly_score_map_add_diff, anomaly_score_map_mul_diff = post_process(cfg, size_list, outputs_list_diff)
-
-    # FINAL (raw + diff)
-    anomaly_score_map_add_final = anomaly_score_map_add_raw + anomaly_score_map_add_diff
-    anomaly_score_map_mul_final = anomaly_score_map_mul_raw + anomaly_score_map_mul_diff
-
-    # IMPORTANT: Make DET AUROC reflect velocity too by recomputing per-image anomaly_score
-    # from the FINAL mul-map using the same top-k mean rule as post_process.
-    anomaly_score_final = anomaly_score_from_mulmap(cfg, anomaly_score_map_mul_final)
-
-    det_auroc, loc_auroc = compute_metrics(gt_label_list, gt_mask_list, anomaly_score_final, anomaly_score_map_add_final)
-    return det_auroc, loc_auroc, fps
-
-
-def write_csv(rows, out_path):
+def write_csv(header: Sequence[str], rows: Sequence[Dict[str, str]], out_path: Path) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    header = [
-        "method",
-        "dataset",
-        "class_name",
-        "ckpt_name",
-        "ckpt_path",
-        "det_auroc",
-        "loc_auroc",
-        "fps",
-    ]
-    with out_path.open("w") as f:
-        f.write(",".join(header) + "\n")
-        for row in rows:
-            f.write(",".join(str(row.get(k, "")) for k in header) + "\n")
+    with out_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(header), extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
 
 
-def write_json(rows, out_path):
-    import json
+def resolve_output_path(roots: Sequence[Path], out_csv: Optional[str]) -> Path:
+    if out_csv:
+        return Path(out_csv)
+    if len(roots) == 1:
+        return roots[0] / "merged_metrics.csv"
+    return Path.cwd() / "merged_metrics.csv"
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    with out_path.open("w") as f:
-        json.dump(rows, f, indent=2)
 
-
-def main():
-    parser = argparse.ArgumentParser(description="Export ROC metrics from MSFlow/velocity checkpoints")
-    parser.add_argument("--dataset", default="mvtec", choices=["mvtec", "visa", "mstc"])
-    parser.add_argument("--class-names", nargs="+", default=["all"])
-    parser.add_argument("--data-path", default=None)
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--msflow-root", default=None)
-    parser.add_argument("--msflow-ckpt-name", default="best_loc_auroc.pt")
-    parser.add_argument("--velocity-roots", nargs="*", default=[])
-    parser.add_argument("--velocity-ckpt-name", default="velocity_best_loc.pt")
-    parser.add_argument("--out-csv", default="./work_dirs/roc_metrics.csv")
-    parser.add_argument("--out-json", default="")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Merge best_metrics.csv files under one or more roots.")
+    parser.add_argument("roots", nargs="+", help="One or more root directories (or files) to search.")
+    parser.add_argument("--pattern", default="best_metrics.csv", help="Filename pattern to search for.")
+    parser.add_argument("--out-csv", default="", help="Output CSV path.")
     args = parser.parse_args()
 
-    if args.data_path is None:
-        if args.dataset == "mvtec":
-            data_path = "./data/MVTec"
-        elif args.dataset == "visa":
-            data_path = "./data/VisA_pytorch/1cls"
-        else:
-            data_path = "./data/shanghaitech"
-    else:
-        data_path = args.data_path
+    roots = [Path(r) for r in args.roots]
+    matched = collect_csvs(roots, args.pattern)
+    if not matched:
+        raise SystemExit(f"No CSV files matched pattern '{args.pattern}' in: {', '.join(map(str, roots))}")
 
-    device = torch.device(args.device if torch.cuda.is_available() or args.device == "cpu" else "cpu")
-
-    base_cfg = make_cfg()
-    rows = []
-    class_names = get_class_names(args.dataset, args.class_names)
-
-    if args.msflow_root:
-        msflow_root = Path(args.msflow_root)
-        method_label = msflow_root.name
-        for cls in class_names:
-            cfg = copy.deepcopy(base_cfg)
-            set_dataset_cfg(cfg, args.dataset, cls, data_path, device)
-            ckpt_path = msflow_root / args.dataset / cls / args.msflow_ckpt_name
-            if not ckpt_path.exists():
-                continue
-            det_auroc, loc_auroc, fps = eval_msflow(cfg, str(ckpt_path), args.batch_size, args.num_workers)
-            rows.append({
-                "method": method_label,
-                "dataset": args.dataset,
-                "class_name": cls,
-                "ckpt_name": args.msflow_ckpt_name,
-                "ckpt_path": str(ckpt_path),
-                "det_auroc": round(det_auroc, 4),
-                "loc_auroc": round(loc_auroc, 4),
-                "fps": round(fps, 4),
-            })
-
-    for vel_root in args.velocity_roots:
-        vel_root = Path(vel_root)
-        method_label = vel_root.name
-        for cls in class_names:
-            cfg = copy.deepcopy(base_cfg)
-            set_dataset_cfg(cfg, args.dataset, cls, data_path, device)
-            vel_ckpt = vel_root / args.dataset / cls / args.velocity_ckpt_name
-            if not vel_ckpt.exists():
-                continue
-            if not args.msflow_root:
-                raise ValueError("velocity evaluation requires --msflow-root for base flow weights")
-            msflow_ckpt = Path(args.msflow_root) / args.dataset / cls / args.msflow_ckpt_name
-            if not msflow_ckpt.exists():
-                continue
-            det_auroc, loc_auroc, fps = eval_velocity(cfg, str(msflow_ckpt), str(vel_ckpt), args.batch_size, args.num_workers)
-            rows.append({
-                "method": method_label,
-                "dataset": args.dataset,
-                "class_name": cls,
-                "ckpt_name": args.velocity_ckpt_name,
-                "ckpt_path": str(vel_ckpt),
-                "det_auroc": round(det_auroc, 4),
-                "loc_auroc": round(loc_auroc, 4),
-                "fps": round(fps, 4),
-            })
-
-    out_csv = Path(args.out_csv)
-    write_csv(rows, out_csv)
-    if args.out_json:
-        write_json(rows, Path(args.out_json))
-    print(f"Saved {len(rows)} rows to {out_csv}")
+    header, rows = read_rows(matched)
+    out_path = resolve_output_path(roots, args.out_csv or None)
+    write_csv(header, rows, out_path)
+    print(f"Saved {len(rows)} rows to {out_path}")
 
 
 if __name__ == "__main__":
