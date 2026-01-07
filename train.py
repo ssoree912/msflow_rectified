@@ -181,7 +181,7 @@ def inference_meta_epoch(c, epoch, loader, extractor, parallel_flows, fusion_flo
                     size_list.append(list(z.shape[-2:]))
                 # Original logp map,  stage 별 logp map 저장
                 logp = - 0.5 * torch.mean(z**2, 1)
-                outputs_list[lvl].append(logp)
+                outputs_list[lvl].append(logp.detach().cpu())
 
                 # If velocity model is available, compute corrected logp
                 # if vel_model is not None and alpha_list is not None:
@@ -214,7 +214,7 @@ def inference_meta_epoch(c, epoch, loader, extractor, parallel_flows, fusion_flo
                 #     z_corr, _ = parallel_flows[lvl](y_corr, [cond_corr, ])
                 #     logp_corr = - 0.5 * torch.mean(z_corr**2, 1)
                 #     # Store difference map: logp(test) - logp(normalized)
-                #     outputs_list_diff[lvl].append(logp - logp_corr)
+                #     outputs_list_diff[lvl].append((logp - logp_corr).detach().cpu())
 
                 # Accumulate NLL loss as before
                 loss += 0.5 * torch.sum(z**2, (1, 2, 3))
