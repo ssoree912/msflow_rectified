@@ -122,12 +122,12 @@ def parsing_args(c):
     elif c.dataset == 'mstc':
         c.input_size = (256, 384)
 
+    pixel_eval_auto = c.pixel_eval is None
     if c.pixel_eval is None:
         c.pixel_eval = c.dataset != 'mstc'
-    if not c.pixel_eval:
-        c.pro_eval = False
-    if c.feature_cache:
+    if c.feature_cache and pixel_eval_auto:
         c.pixel_eval = False
+    if not c.pixel_eval:
         c.pro_eval = False
 
     return c

@@ -353,6 +353,15 @@ class MSTCFeatureDataset(Dataset):
         self._cache_idx = None
         self._cache_data = None
         self._suffix = suffix
+        self._vids = []
+        self.pixel_eval = getattr(c, "pixel_eval", False) and (not is_train)
+        self._mask_cache_vid = None
+        self._mask_cache = None
+        self._mask_offset = {}
+        self.transform_mask = T.Compose([
+            T.Resize(c.input_size, InterpolationMode.NEAREST),
+            T.ToTensor()
+        ])
         manifest_path = os.path.join(self.feature_dir, 'manifest.json')
         video_counts = {}
         stage_channels = None
@@ -391,6 +400,7 @@ class MSTCFeatureDataset(Dataset):
             vid = os.path.basename(fpath)
             if vid.endswith(suffix):
                 vid = vid[:-len(suffix)]
+            self._vids.append(vid)
             if vid not in video_counts:
                 missing_counts += 1
         if missing_counts:
@@ -426,6 +436,18 @@ class MSTCFeatureDataset(Dataset):
         self._cache_data = data
         return data
 
+    def _load_mask_for_vid(self, vid):
+        if self._mask_cache_vid == vid and self._mask_cache is not None:
+            return self._mask_cache
+        mask_path = os.path.join(self.c.data_path, 'testing', 'test_pixel_mask', f'{vid}.npy')
+        if not os.path.isfile(mask_path):
+            self._mask_cache_vid = vid
+            self._mask_cache = None
+            return None
+        self._mask_cache = np.load(mask_path, mmap_mode='r')
+        self._mask_cache_vid = vid
+        return self._mask_cache
+
     def __getitem__(self, idx):
         file_idx = bisect.bisect_right(self._cum_counts, idx)
         start = 0 if file_idx == 0 else self._cum_counts[file_idx - 1]
@@ -441,4 +463,33 @@ class MSTCFeatureDataset(Dataset):
             s3 = s3.float()
         label = int(data["labels"][local_idx])
         mask = torch.zeros([1, *self.c.input_size], dtype=torch.float32)
+        if self.pixel_eval:
+            vid = self._vids[file_idx]
+            mask_arr = self._load_mask_for_vid(vid)
+            if mask_arr is not None and mask_arr.shape[0] > 0:
+                frame_indices = data.get("frame_indices")
+                if frame_indices is not None:
+                    fidx = int(frame_indices[local_idx])
+                    if vid not in self._mask_offset:
+                        min_idx = int(np.min(frame_indices))
+                        max_idx = int(np.max(frame_indices))
+                        mask_len = int(mask_arr.shape[0])
+                        if max_idx == mask_len and min_idx >= 1:
+                            self._mask_offset[vid] = -1
+                        elif max_idx >= mask_len:
+                            self._mask_offset[vid] = -1
+                        else:
+                            self._mask_offset[vid] = 0
+                    fidx += self._mask_offset.get(vid, 0)
+                else:
+                    fidx = local_idx
+                fidx = max(0, min(fidx, int(mask_arr.shape[0]) - 1))
+                m = mask_arr[fidx]
+                m = (m > 0).astype(np.uint8)
+                if m.shape[0] != self.c.input_size[0] or m.shape[1] != self.c.input_size[1]:
+                    m = Image.fromarray(m * 255)
+                    mask = self.transform_mask(m)
+                    mask = (mask > 0.5).float()
+                else:
+                    mask = torch.from_numpy(m).unsqueeze(0).float()
         return s1, s2, s3, label, mask
