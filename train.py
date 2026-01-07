@@ -19,6 +19,16 @@ from evaluations import eval_det_loc
 from pruning.utils import resolve_pruning_mode, apply_pruning_mask, extractor_forward
 
 #한 배치를 flow까지 통과시키는 학숨
+def _format_seconds(seconds):
+    seconds = int(seconds)
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h > 0:
+        return f"{h:d}:{m:02d}:{s:02d}"
+    return f"{m:d}:{s:02d}"
+
+
 def model_forward(c, extractor, parallel_flows, fusion_flow, image):
     h_list = extractor_forward(c, extractor, image) #고정으로 쓰는 백본, 특징 추출기
     #논문에서 말하는 fearure pyramid를 pooling으로 정리 , stage 마다 조건으로 encoding을 넣고 parallel flow에 전달
@@ -67,14 +77,23 @@ def train_meta_epoch(c, epoch, loader, extractor, parallel_flows, fusion_flow, p
     for sub_epoch in range(c.sub_epochs):
         epoch_loss = 0.
         image_count = 0
+        seen = 0
+        total_samples = len(loader.dataset)
+        total_batches = len(loader)
+        log_interval = int(getattr(c, "log_interval", 0))
+        if log_interval < 1:
+            log_interval = None
+        sub_start = time.time()
         for idx, batch in enumerate(loader):
             optimizer.zero_grad()
             if c.feature_cache:
                 f1, f2, f3, _, _ = batch
                 feats = [f1.to(c.device), f2.to(c.device), f3.to(c.device)]
+                batch_size = feats[0].shape[0]
             else:
                 image, _, _ = batch
                 image = image.to(c.device)
+                batch_size = image.shape[0]
             if scaler:
                 with autocast():
                     if c.feature_cache:
@@ -105,10 +124,19 @@ def train_meta_epoch(c, epoch, loader, extractor, parallel_flows, fusion_flow, p
                 torch.nn.utils.clip_grad_norm_(params, 2)
                 optimizer.step()
             epoch_loss += t2np(loss)
-            if c.feature_cache:
-                image_count += feats[0].shape[0]
-            else:
-                image_count += image.shape[0]
+            image_count += batch_size
+            seen += batch_size
+            if log_interval and ((idx == 0) or ((idx + 1) % log_interval == 0) or ((idx + 1) == total_batches)):
+                elapsed = time.time() - sub_start
+                rate = seen / elapsed if elapsed > 0 else 0.0
+                remain = total_samples - seen
+                eta = _format_seconds(remain / rate) if rate > 0 else "?:??"
+                pct = (100.0 * seen / total_samples) if total_samples else 0.0
+                print(
+                    datetime.datetime.now().strftime("[%Y-%m-%d-%H:%M:%S]"),
+                    f"Epoch {epoch}.{sub_epoch} step {idx+1}/{total_batches} "
+                    f"{seen}/{total_samples} ({pct:.1f}%) {rate:.1f} samples/s ETA {eta}"
+                )
         lr = optimizer.state_dict()['param_groups'][0]['lr']
         if warmup_scheduler:
             warmup_scheduler.step()
@@ -259,7 +287,8 @@ def train(c):
         except Exception as e:
             print(f"[WARN] Could not load velocity nets: {e}")
 
-    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=c.batch_size, shuffle=True, num_workers=c.workers, pin_memory=True)
+    shuffle_train = False if c.feature_cache else True
+    train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=c.batch_size, shuffle=shuffle_train, num_workers=c.workers, pin_memory=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=c.batch_size, shuffle=False, num_workers=c.workers, pin_memory=True)
 
     if c.feature_cache:

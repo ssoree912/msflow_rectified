@@ -35,6 +35,8 @@ def parsing_args(c):
                         help='train batch size')
     parser.add_argument('--workers', default=c.workers, type=int,
                         help='num dataloader workers')
+    parser.add_argument('--log-interval', default=c.log_interval, type=int,
+                        help='log training progress every N batches (0 to disable)')
     parser.add_argument('--mstc-frame-stride', default=c.mstc_frame_stride, type=int,
                         help='frame stride for mstc (every Nth frame)')
     parser.add_argument('--meta-epochs', default=25, type=int,

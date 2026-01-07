@@ -59,3 +59,6 @@ feature_fp32 = True
 
 # results
 work_dir = './work_dirs'
+
+# logging
+log_interval = 50

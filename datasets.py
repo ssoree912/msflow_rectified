@@ -369,7 +369,13 @@ class MSTCFeatureDataset(Dataset):
 
         if stage_channels and stage_shapes:
             self.output_channels = [int(x) for x in stage_channels]
-            self.stage_hw = [(int(h), int(w)) for h, w in stage_shapes]
+            self.stage_hw = []
+            for shape in stage_shapes:
+                if len(shape) >= 2:
+                    h, w = shape[-2], shape[-1]
+                    self.stage_hw.append((int(h), int(w)))
+                else:
+                    raise ValueError(f"Invalid stage_shapes entry: {shape}")
         else:
             data = np.load(self.files[0], allow_pickle=True).item()
             self._cache_idx = 0
