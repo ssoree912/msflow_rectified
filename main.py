@@ -70,6 +70,8 @@ def parsing_args(c):
                         help='enable pixel-level eval (Loc.AUROC/PRO).')
     parser.add_argument('--no-pixel-eval', dest='pixel_eval', action='store_false',
                         help='disable pixel-level eval (Det.AUROC only).')
+    parser.add_argument('--pixel-eval-downscale', default=c.pixel_eval_downscale, type=int,
+                        help='downscale factor for pixel eval maps (1 = full size)')
     parser.set_defaults(pixel_eval=None)
     parser.add_argument('--save-root', default=None, type=str,
                         help='override root directory for checkpoints (default: work_dir)')

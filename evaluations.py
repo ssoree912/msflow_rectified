@@ -5,6 +5,7 @@ from skimage.measure import label, regionprops
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from utils import rescale
 
@@ -75,6 +76,10 @@ def eval_det_loc(det_auroc_obs, loc_auroc_obs, loc_pro_obs, epoch, gt_label_list
         gt_mask = gt_mask[:, 0, ...]
     elif gt_mask.ndim != 3:
         return det_auroc, None, None, best_det_auroc, False, False
+    if anomaly_score_map_add is not None and gt_mask.shape[-2:] != anomaly_score_map_add.shape[-2:]:
+        mask_t = torch.from_numpy(gt_mask.astype(np.float32)).unsqueeze(1)
+        mask_t = F.interpolate(mask_t, size=anomaly_score_map_add.shape[-2:], mode='nearest')
+        gt_mask = mask_t.squeeze(1).numpy().astype(bool)
 
     has_pos = gt_mask.any()
     has_neg = (~gt_mask).any()

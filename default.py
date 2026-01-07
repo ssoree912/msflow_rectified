@@ -49,6 +49,7 @@ top_k = 0.03
 pro_eval = True
 pro_eval_interval = 6
 pixel_eval = True
+pixel_eval_downscale = 1
 
 # feature cache (mstc)
 feature_cache = False
