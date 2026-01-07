@@ -47,6 +47,14 @@ dwa_threshold_percentile = 50
 top_k = 0.03
 pro_eval = True
 pro_eval_interval = 6
+pixel_eval = True
+
+# feature cache (mstc)
+feature_cache = False
+feature_cache_dir = None
+feature_subdir = 'features'
+feature_suffix = '_res.npy'
+feature_fp32 = True
 
 # results
 work_dir = './work_dirs'

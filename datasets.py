@@ -1,4 +1,6 @@
 import os
+import re
+import bisect
 from PIL import Image
 import numpy as np
 import torch
@@ -7,7 +9,7 @@ from torch.utils.data import Dataset
 from torchvision import transforms as T
 from torchvision.transforms import InterpolationMode
 
-__all__ = ('MVTecDataset', 'VisADataset', 'MSTCDataset')
+__all__ = ('MVTecDataset', 'VisADataset', 'MSTCDataset', 'MSTCFeatureDataset')
 
 MVTEC_CLASS_NAMES = ['bottle', 'cable', 'capsule', 'carpet', 'grid',
                'hazelnut', 'leather', 'metal_nut', 'pill', 'screw',
@@ -201,6 +203,7 @@ class MSTCDataset(Dataset):
         self.is_train = is_train
         self.root = c.data_path  # e.g., ./data/shanghaitech
         self.input_size = c.input_size  # (256,384)
+        self.pixel_eval = getattr(c, 'pixel_eval', True)
 
         split_dir = 'training' if is_train else 'testing'
         self.frames_dir = os.path.join(self.root, split_dir, 'frames')
@@ -236,11 +239,8 @@ class MSTCDataset(Dataset):
         for i, p in enumerate(self.x):
             vid = os.path.basename(os.path.dirname(p))
             stem = os.path.splitext(os.path.basename(p))[0]
-            try:
-                fidx = int(stem)  # 0-based or 000-based
-            except:
-                # fallback: strip leading zeros
-                fidx = int(stem.lstrip('0') or '0')
+            m = re.search(r'(\d+)$', stem)
+            fidx = int(m.group(1)) if m else 0
 
             self._vid_of.append(vid)
             self._idx_in_vid.append(fidx)
@@ -260,7 +260,7 @@ class MSTCDataset(Dataset):
                     self._frame_labels[vid] = np.load(fm_path)  # shape [N]
                 else:
                     self._frame_labels[vid] = None
-                if os.path.isfile(pm_path):
+                if self.pixel_eval and os.path.isfile(pm_path):
                     self._pixel_masks[vid] = np.load(pm_path)   # shape [N,H,W] (bool/int)
                 else:
                     self._pixel_masks[vid] = None
@@ -299,6 +299,10 @@ class MSTCDataset(Dataset):
         if self._frame_labels.get(vid) is not None and fidx < len(self._frame_labels[vid]):
             y = int(self._frame_labels[vid][fidx])
 
+        if not self.pixel_eval:
+            mask = torch.zeros([1, *self.input_size], dtype=torch.float32)
+            return img, y, mask
+
         # pixel mask (if provided)
         if self._pixel_masks.get(vid) is not None and fidx < len(self._pixel_masks[vid]):
             m = self._pixel_masks[vid][fidx]
@@ -311,3 +315,73 @@ class MSTCDataset(Dataset):
             mask = torch.zeros([1, *self.input_size], dtype=torch.float32)
 
         return img, y, mask
+
+
+class MSTCFeatureDataset(Dataset):
+    """
+    Load precomputed per-video features saved as <video_id>_res.npy.
+    Each file contains a dict with keys: s1, s2, s3, labels, frame_indices, paths.
+    Returns (s1, s2, s3, y, mask), where mask is zeros (pixel eval disabled).
+    """
+    def __init__(self, c, is_train=True):
+        self.c = c
+        self.is_train = is_train
+        split_dir = 'training' if is_train else 'testing'
+        root = getattr(c, 'feature_cache_dir', None) or c.data_path
+        subdir = getattr(c, 'feature_subdir', 'features')
+        suffix = getattr(c, 'feature_suffix', '_res.npy')
+        self.feature_dir = os.path.join(root, split_dir, subdir)
+        if not os.path.isdir(self.feature_dir):
+            raise FileNotFoundError(f'feature_dir not found: {self.feature_dir}')
+        self.files = sorted([
+            os.path.join(self.feature_dir, f)
+            for f in os.listdir(self.feature_dir)
+            if f.endswith(suffix)
+        ])
+        if not self.files:
+            raise FileNotFoundError(f'no feature files found under: {self.feature_dir}')
+
+        self._counts = []
+        self._cache_idx = None
+        self._cache_data = None
+        for i, fpath in enumerate(self.files):
+            data = np.load(fpath, allow_pickle=True).item()
+            if i == 0:
+                self._cache_idx = 0
+                self._cache_data = data
+                s1, s2, s3 = data["s1"], data["s2"], data["s3"]
+                self.output_channels = [s1.shape[1], s2.shape[1], s3.shape[1]]
+                self.stage_hw = [(s1.shape[2], s1.shape[3]),
+                                 (s2.shape[2], s2.shape[3]),
+                                 (s3.shape[2], s3.shape[3])]
+            self._counts.append(int(data["s1"].shape[0]))
+        self._cum_counts = np.cumsum(self._counts)
+        self._feature_fp32 = getattr(c, "feature_fp32", True)
+
+    def __len__(self):
+        return int(self._cum_counts[-1])
+
+    def _load_file(self, file_idx):
+        if self._cache_idx == file_idx and self._cache_data is not None:
+            return self._cache_data
+        data = np.load(self.files[file_idx], allow_pickle=True).item()
+        self._cache_idx = file_idx
+        self._cache_data = data
+        return data
+
+    def __getitem__(self, idx):
+        file_idx = bisect.bisect_right(self._cum_counts, idx)
+        start = 0 if file_idx == 0 else self._cum_counts[file_idx - 1]
+        local_idx = idx - start
+        data = self._load_file(file_idx)
+
+        s1 = torch.from_numpy(data["s1"][local_idx])
+        s2 = torch.from_numpy(data["s2"][local_idx])
+        s3 = torch.from_numpy(data["s3"][local_idx])
+        if self._feature_fp32:
+            s1 = s1.float()
+            s2 = s2.float()
+            s3 = s3.float()
+        label = int(data["labels"][local_idx])
+        mask = torch.zeros([1, *self.c.input_size], dtype=torch.float32)
+        return s1, s2, s3, label, mask

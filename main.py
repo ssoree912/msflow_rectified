@@ -47,6 +47,24 @@ def parsing_args(c):
                         help='evaluate the pro score or not.')
     parser.add_argument('--pro-eval-interval', default=1, type=int, 
                         help='interval for pro evaluation.')
+    parser.add_argument('--feature-cache', action='store_true', default=False,
+                        help='use precomputed features instead of images (mstc only)')
+    parser.add_argument('--feature-cache-dir', default=None, type=str,
+                        help='root directory containing training/features and testing/features')
+    parser.add_argument('--feature-subdir', default='features', type=str,
+                        help='subdir name under split for feature cache')
+    parser.add_argument('--feature-suffix', default='_res.npy', type=str,
+                        help='feature file suffix (default: _res.npy)')
+    parser.add_argument('--feature-fp32', dest='feature_fp32', action='store_true',
+                        help='cast cached features to fp32 (default)')
+    parser.add_argument('--feature-fp16', dest='feature_fp32', action='store_false',
+                        help='keep cached features in fp16')
+    parser.set_defaults(feature_fp32=True)
+    parser.add_argument('--pixel-eval', dest='pixel_eval', action='store_true',
+                        help='enable pixel-level eval (Loc.AUROC/PRO).')
+    parser.add_argument('--no-pixel-eval', dest='pixel_eval', action='store_false',
+                        help='disable pixel-level eval (Det.AUROC only).')
+    parser.set_defaults(pixel_eval=None)
     parser.add_argument('--save-root', default=None, type=str,
                         help='override root directory for checkpoints (default: work_dir)')
     parser.add_argument(
@@ -97,6 +115,14 @@ def parsing_args(c):
         c.input_size = (256, 256) if c.class_name == 'transistor' else (512, 512)
     elif c.dataset == 'mstc':
         c.input_size = (256, 384)
+
+    if c.pixel_eval is None:
+        c.pixel_eval = c.dataset != 'mstc'
+    if not c.pixel_eval:
+        c.pro_eval = False
+    if c.feature_cache:
+        c.pixel_eval = False
+        c.pro_eval = False
 
     return c
 

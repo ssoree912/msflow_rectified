@@ -9,7 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.cuda.amp import autocast, GradScaler
 
-from datasets import MVTecDataset, VisADataset, MSTCDataset
+from datasets import MVTecDataset, VisADataset, MSTCDataset, MSTCFeatureDataset
 from models.extractors import build_extractor
 from models.flow_models import build_msflow_model
 from models.velocity import Velocity3Stage
@@ -44,6 +44,22 @@ def model_forward(c, extractor, parallel_flows, fusion_flow, image):
 
     return z_list, jac
 
+
+def model_forward_features(c, parallel_flows, fusion_flow, feats_list):
+    # feats_list: list of pooled feature maps per stage (B,C,H,W)
+    z_list = []
+    parallel_jac_list = []
+    for idx, (y, parallel_flow, c_cond) in enumerate(zip(feats_list, parallel_flows, c.c_conds)):
+        B, _, H, W = y.shape
+        cond = positionalencoding2d(c_cond, H, W).to(c.device).unsqueeze(0).repeat(B, 1, 1, 1)
+        z, jac = parallel_flow(y, [cond, ])
+        z_list.append(z)
+        parallel_jac_list.append(jac)
+
+    z_list, fuse_jac = fusion_flow(z_list)
+    jac = fuse_jac + sum(parallel_jac_list)
+    return z_list, jac
+
 def train_meta_epoch(c, epoch, loader, extractor, parallel_flows, fusion_flow, params, optimizer, warmup_scheduler, decay_scheduler, scaler=None):
     parallel_flows = [parallel_flow.train() for parallel_flow in parallel_flows]
     fusion_flow = fusion_flow.train()
@@ -51,12 +67,20 @@ def train_meta_epoch(c, epoch, loader, extractor, parallel_flows, fusion_flow, p
     for sub_epoch in range(c.sub_epochs):
         epoch_loss = 0.
         image_count = 0
-        for idx, (image, _, _) in enumerate(loader):
+        for idx, batch in enumerate(loader):
             optimizer.zero_grad()
-            image = image.to(c.device)
+            if c.feature_cache:
+                f1, f2, f3, _, _ = batch
+                feats = [f1.to(c.device), f2.to(c.device), f3.to(c.device)]
+            else:
+                image, _, _ = batch
+                image = image.to(c.device)
             if scaler:
                 with autocast():
-                    z_list, jac = model_forward(c, extractor, parallel_flows, fusion_flow, image)
+                    if c.feature_cache:
+                        z_list, jac = model_forward_features(c, parallel_flows, fusion_flow, feats)
+                    else:
+                        z_list, jac = model_forward(c, extractor, parallel_flows, fusion_flow, image)
                     loss = 0.
                     for z in z_list:
                         loss += 0.5 * torch.sum(z**2, (1, 2, 3))
@@ -68,7 +92,10 @@ def train_meta_epoch(c, epoch, loader, extractor, parallel_flows, fusion_flow, p
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                z_list, jac = model_forward(c, extractor, parallel_flows, fusion_flow, image)
+                if c.feature_cache:
+                    z_list, jac = model_forward_features(c, parallel_flows, fusion_flow, feats)
+                else:
+                    z_list, jac = model_forward(c, extractor, parallel_flows, fusion_flow, image)
                 loss = 0.
                 for z in z_list:
                     loss += 0.5 * torch.sum(z**2, (1, 2, 3)) #NLL loss : 0.5 * ||z||^2, 정상 데이터를 높은 loglikelihood로 만들도록 학습하는 구조
@@ -78,7 +105,10 @@ def train_meta_epoch(c, epoch, loader, extractor, parallel_flows, fusion_flow, p
                 torch.nn.utils.clip_grad_norm_(params, 2)
                 optimizer.step()
             epoch_loss += t2np(loss)
-            image_count += image.shape[0]
+            if c.feature_cache:
+                image_count += feats[0].shape[0]
+            else:
+                image_count += image.shape[0]
         lr = optimizer.state_dict()['param_groups'][0]['lr']
         if warmup_scheduler:
             warmup_scheduler.step()
@@ -102,12 +132,20 @@ def inference_meta_epoch(c, epoch, loader, extractor, parallel_flows, fusion_flo
     size_list = []
     start = time.time()
     with torch.no_grad():
-        for idx, (image, label, mask) in enumerate(loader):
-            image = image.to(c.device)
+        for idx, batch in enumerate(loader):
+            if c.feature_cache:
+                f1, f2, f3, label, mask = batch
+                feats = [f1.to(c.device), f2.to(c.device), f3.to(c.device)]
+            else:
+                image, label, mask = batch
+                image = image.to(c.device)
             gt_label_list.extend(t2np(label))
             gt_mask_list.extend(t2np(mask))
 
-            z_list, jac = model_forward(c, extractor, parallel_flows, fusion_flow, image)
+            if c.feature_cache:
+                z_list, jac = model_forward_features(c, parallel_flows, fusion_flow, feats)
+            else:
+                z_list, jac = model_forward(c, extractor, parallel_flows, fusion_flow, image)
 
             loss = 0.
             for lvl, z in enumerate(z_list):
@@ -156,7 +194,10 @@ def inference_meta_epoch(c, epoch, loader, extractor, parallel_flows, fusion_flo
             loss = loss - jac
             loss = loss.mean()
             epoch_loss += t2np(loss)
-            image_count += image.shape[0]
+            if c.feature_cache:
+                image_count += feats[0].shape[0]
+            else:
+                image_count += image.shape[0]
 
         mean_epoch_loss = epoch_loss / image_count
         fps = len(loader.dataset) / (time.time() - start)
@@ -187,16 +228,21 @@ def train(c):
             group=c.version_name,
             name=c.class_name)
     
-    Dataset = MVTecDataset if c.dataset == 'mvtec' else (VisADataset if c.dataset == 'visa' else MSTCDataset)
+    if c.feature_cache:
+        if c.dataset != 'mstc':
+            raise ValueError("feature cache is only supported for mstc")
+        Dataset = MSTCFeatureDataset
+    else:
+        Dataset = MVTecDataset if c.dataset == 'mvtec' else (VisADataset if c.dataset == 'visa' else MSTCDataset)
 
     train_dataset = Dataset(c, is_train=True)
-    test_dataset  = Dataset(c, is_train=False)
+    test_dataset = Dataset(c, is_train=False)
     
     # Try to load pretrained velocity nets for this class
     vel_ckpt = os.path.join('work_dirs', 'velocity_preflow', c.dataset, c.class_name, 'velocity_last.pt')
     vel_model = None
     alpha_list = None
-    if os.path.exists(vel_ckpt):
+    if not c.feature_cache and os.path.exists(vel_ckpt):
         try:
             # Build extractor to know stage channels
             extractor_tmp, c_list = build_extractor(c)
@@ -216,19 +262,25 @@ def train(c):
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=c.batch_size, shuffle=True, num_workers=c.workers, pin_memory=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=c.batch_size, shuffle=False, num_workers=c.workers, pin_memory=True)
 
-    extractor, output_channels = build_extractor(c)
-    if c.pruning_type_value == "dense":
-        applied_sparsity = apply_pruning_mask(extractor, 0.0)
+    if c.feature_cache:
+        extractor = None
+        output_channels = [int(x) for x in train_dataset.output_channels]
+        stage_hw = [(int(h), int(w)) for h, w in train_dataset.stage_hw]
+        print(f"[FeatureCache] Using cached features from {c.feature_subdir}, skip extractor.")
     else:
-        applied_sparsity = apply_pruning_mask(extractor, c.pruning_sparsity)
-    c.pruning_applied_sparsity = applied_sparsity
-    print(
-        f"[Pruning] mode={c.pruning_mode} "
-        f"(type_value={c.pruning_type_value}, forward_type={c.pruning_forward_type}), "
-        f"sparsity={c.pruning_sparsity:.4f}, applied={applied_sparsity:.4f}"
-    )
-    stage_hw = infer_stage_hw(c, extractor)
-    extractor = extractor.to(c.device).eval()
+        extractor, output_channels = build_extractor(c)
+        if c.pruning_type_value == "dense":
+            applied_sparsity = apply_pruning_mask(extractor, 0.0)
+        else:
+            applied_sparsity = apply_pruning_mask(extractor, c.pruning_sparsity)
+        c.pruning_applied_sparsity = applied_sparsity
+        print(
+            f"[Pruning] mode={c.pruning_mode} "
+            f"(type_value={c.pruning_type_value}, forward_type={c.pruning_forward_type}), "
+            f"sparsity={c.pruning_sparsity:.4f}, applied={applied_sparsity:.4f}"
+        )
+        stage_hw = infer_stage_hw(c, extractor)
+        extractor = extractor.to(c.device).eval()
     parallel_flows, fusion_flow = build_msflow_model(c, output_channels, stage_hw)
     parallel_flows = [parallel_flow.to(c.device) for parallel_flow in parallel_flows]
     fusion_flow = fusion_flow.to(c.device)
@@ -263,7 +315,13 @@ def train(c):
         # New: process difference maps and sum for localization only
         _, anomaly_score_map_add_diff, _ = post_process(c, size_list, outputs_list_diff)
         anomaly_score_map_add = anomaly_score_map_add
-        det_auroc, loc_auroc, loc_pro_auc, best_det_auroc, best_loc_auroc, best_loc_pro = eval_det_loc(det_auroc_obs, loc_auroc_obs, loc_pro_obs, epoch, gt_label_list, anomaly_score, gt_mask_list, anomaly_score_map_add, anomaly_score_map_mul, c.pro_eval)
+        pixel_eval = getattr(c, 'pixel_eval', True)
+        det_auroc, loc_auroc, loc_pro_auc, best_det_auroc, best_loc_auroc, best_loc_pro = eval_det_loc(
+            det_auroc_obs, loc_auroc_obs, loc_pro_obs, epoch,
+            gt_label_list, anomaly_score, gt_mask_list,
+            anomaly_score_map_add, anomaly_score_map_mul,
+            c.pro_eval, pixel_eval=pixel_eval
+        )
         
         return
     
@@ -306,23 +364,27 @@ def train(c):
         else:
             pro_eval = False
 
+        pixel_eval = getattr(c, 'pixel_eval', True)
         det_auroc, loc_auroc, loc_pro_auc, \
             best_det_auroc, best_loc_auroc, best_loc_pro = \
-                eval_det_loc(det_auroc_obs, loc_auroc_obs, loc_pro_obs, epoch, gt_label_list, anomaly_score, gt_mask_list, anomaly_score_map_add, anomaly_score_map_mul, pro_eval)
+                eval_det_loc(
+                    det_auroc_obs, loc_auroc_obs, loc_pro_obs, epoch,
+                    gt_label_list, anomaly_score, gt_mask_list,
+                    anomaly_score_map_add, anomaly_score_map_mul,
+                    pro_eval, pixel_eval=pixel_eval
+                )
         if best_det_auroc:
             best_det_fps = last_fps
         if best_loc_auroc:
             best_loc_fps = last_fps
 
         if c.wandb_enable:
-            wandb_run.log(
-                {
-                    'Det.AUROC': det_auroc,
-                    'Loc.AUROC': loc_auroc,
-                    'Loc.PRO': loc_pro_auc
-                },
-                step=epoch
-            )
+            log_payload = {'Det.AUROC': det_auroc}
+            if loc_auroc is not None:
+                log_payload['Loc.AUROC'] = loc_auroc
+            if loc_pro_auc is not None:
+                log_payload['Loc.PRO'] = loc_pro_auc
+            wandb_run.log(log_payload, step=epoch)
 
         save_weights(epoch, parallel_flows, fusion_flow, 'last', c.ckpt_dir, optimizer)
         if best_det_auroc and c.mode == 'train':
@@ -335,16 +397,25 @@ def train(c):
     if c.mode == 'train' and last_fps is not None:
         if best_det_fps is None:
             best_det_fps = last_fps
-        if best_loc_fps is None:
+        pixel_eval = getattr(c, 'pixel_eval', True)
+        if pixel_eval and best_loc_fps is None:
             best_loc_fps = last_fps
         out_path = os.path.join(c.ckpt_dir, 'best_metrics.csv')
         with open(out_path, 'w') as f:
             f.write('dataset,class_name,best_det_auroc,best_det_epoch,best_det_fps,best_loc_auroc,best_loc_epoch,best_loc_fps\n')
+            if pixel_eval:
+                loc_score = f'{loc_auroc_obs.max_score:.4f}'
+                loc_epoch = f'{loc_auroc_obs.max_epoch}'
+                loc_fps = f'{best_loc_fps:.4f}'
+            else:
+                loc_score = 'na'
+                loc_epoch = 'na'
+                loc_fps = 'na'
             f.write(
                 f'{c.dataset},{c.class_name},'
                 f'{det_auroc_obs.max_score:.4f},{det_auroc_obs.max_epoch},'
                 f'{best_det_fps:.4f},'
-                f'{loc_auroc_obs.max_score:.4f},{loc_auroc_obs.max_epoch},'
-                f'{best_loc_fps:.4f}\n'
+                f'{loc_score},{loc_epoch},'
+                f'{loc_fps}\n'
             )
         print(f"Saved best metrics to {out_path}")

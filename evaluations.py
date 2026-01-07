@@ -64,10 +64,23 @@ def single_process(anomaly_score_map, gt_mask, thred):
     return pros_mean, fpr
 
 
-def eval_det_loc(det_auroc_obs, loc_auroc_obs, loc_pro_obs, epoch, gt_label_list, anomaly_score, gt_mask_list, anomaly_score_map_add, anomaly_score_map_mul, pro_eval):
+def eval_det_loc(det_auroc_obs, loc_auroc_obs, loc_pro_obs, epoch, gt_label_list, anomaly_score, gt_mask_list, anomaly_score_map_add, anomaly_score_map_mul, pro_eval, pixel_eval=True):
     gt_label = np.asarray(gt_label_list, dtype=bool)
-    gt_mask = np.squeeze(np.asarray(gt_mask_list, dtype=bool), axis=1)
     det_auroc, best_det_auroc = eval_det_auroc(det_auroc_obs, epoch, gt_label, anomaly_score)
+    if not pixel_eval:
+        return det_auroc, None, None, best_det_auroc, False, False
+
+    gt_mask = np.asarray(gt_mask_list, dtype=bool)
+    if gt_mask.ndim == 4:
+        gt_mask = gt_mask[:, 0, ...]
+    elif gt_mask.ndim != 3:
+        return det_auroc, None, None, best_det_auroc, False, False
+
+    has_pos = gt_mask.any()
+    has_neg = (~gt_mask).any()
+    if not (has_pos and has_neg):
+        return det_auroc, None, None, best_det_auroc, False, False
+
     loc_auroc, best_loc_auroc = eval_loc_auroc(loc_auroc_obs, epoch, gt_mask, anomaly_score_map_add)
     if pro_eval:
         loc_pro_auc, best_loc_pro = eval_seg_pro(loc_pro_obs, epoch, gt_mask, anomaly_score_map_mul)
