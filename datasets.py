@@ -235,7 +235,12 @@ class MSTCDataset(Dataset):
         # path .../frames/<vid>/<frame>.jpg
         self._vid_of = []
         self._idx_in_vid = []
+        self._pos_in_vid = []
         self._vid_start_index = {}  # to speed label/mask lookup
+        self._vid_min_idx = {}
+        self._vid_max_idx = {}
+        self._mask_offset = {}
+        self._vid_counts = {}
 
         # lazily load masks for test
         self._frame_labels = {}   # vid -> np.ndarray shape [N]
@@ -244,6 +249,7 @@ class MSTCDataset(Dataset):
         # scan and fill indices
         last_vid = None
         count = 0
+        vid_pos = {}
         for i, p in enumerate(self.x):
             vid = os.path.basename(os.path.dirname(p))
             stem = os.path.splitext(os.path.basename(p))[0]
@@ -252,10 +258,18 @@ class MSTCDataset(Dataset):
 
             self._vid_of.append(vid)
             self._idx_in_vid.append(fidx)
+            pos = vid_pos.get(vid, 0)
+            self._pos_in_vid.append(pos)
+            vid_pos[vid] = pos + 1
+            if vid not in self._vid_min_idx or fidx < self._vid_min_idx[vid]:
+                self._vid_min_idx[vid] = fidx
+            if vid not in self._vid_max_idx or fidx > self._vid_max_idx[vid]:
+                self._vid_max_idx[vid] = fidx
             if vid != last_vid:
                 self._vid_start_index[vid] = count
                 last_vid = vid
             count += 1
+        self._vid_counts = vid_pos
 
         if not is_train:
             # load test masks (frame-level & pixel-level) per video
@@ -300,7 +314,32 @@ class MSTCDataset(Dataset):
 
         # test:
         vid = self._vid_of[idx]
+        pos_idx = self._pos_in_vid[idx]
         fidx = self._idx_in_vid[idx]
+        mask_len = None
+        if self._frame_labels.get(vid) is not None:
+            mask_len = len(self._frame_labels[vid])
+        elif self._pixel_masks.get(vid) is not None:
+            mask_len = len(self._pixel_masks[vid])
+        use_pos_index = mask_len is not None and mask_len == self._vid_counts.get(vid, 0)
+        if use_pos_index:
+            fidx = pos_idx
+        else:
+            if vid not in self._mask_offset:
+                if mask_len is not None:
+                    min_idx = self._vid_min_idx.get(vid, 0)
+                    max_idx = self._vid_max_idx.get(vid, 0)
+                    if max_idx == mask_len and min_idx >= 1:
+                        self._mask_offset[vid] = -1
+                    elif max_idx >= mask_len:
+                        self._mask_offset[vid] = -1
+                    else:
+                        self._mask_offset[vid] = 0
+                else:
+                    self._mask_offset[vid] = 0
+            fidx = fidx + self._mask_offset.get(vid, 0)
+        if self._frame_labels.get(vid) is not None:
+            fidx = max(0, min(fidx, len(self._frame_labels[vid]) - 1))
 
         # frame label
         y = 0
@@ -357,6 +396,8 @@ class MSTCFeatureDataset(Dataset):
         self.pixel_eval = getattr(c, "pixel_eval", False) and (not is_train)
         self._mask_cache_vid = None
         self._mask_cache = None
+        self._frame_cache_vid = None
+        self._frame_cache = None
         self._mask_offset = {}
         self.transform_mask = T.Compose([
             T.Resize(c.input_size, InterpolationMode.NEAREST),
@@ -448,6 +489,18 @@ class MSTCFeatureDataset(Dataset):
         self._mask_cache_vid = vid
         return self._mask_cache
 
+    def _load_frame_labels_for_vid(self, vid):
+        if self._frame_cache_vid == vid and self._frame_cache is not None:
+            return self._frame_cache
+        label_path = os.path.join(self.c.data_path, 'testing', 'test_frame_mask', f'{vid}.npy')
+        if not os.path.isfile(label_path):
+            self._frame_cache_vid = vid
+            self._frame_cache = None
+            return None
+        self._frame_cache = np.load(label_path, mmap_mode='r')
+        self._frame_cache_vid = vid
+        return self._frame_cache
+
     def __getitem__(self, idx):
         file_idx = bisect.bisect_right(self._cum_counts, idx)
         start = 0 if file_idx == 0 else self._cum_counts[file_idx - 1]
@@ -461,29 +514,48 @@ class MSTCFeatureDataset(Dataset):
             s1 = s1.float()
             s2 = s2.float()
             s3 = s3.float()
-        label = int(data["labels"][local_idx])
+        label = int(data["labels"][local_idx]) if "labels" in data else 0
         mask = torch.zeros([1, *self.c.input_size], dtype=torch.float32)
-        if self.pixel_eval:
+        fidx = None
+        vid = None
+        frame_labels = None
+        mask_arr = None
+        if not self.is_train:
             vid = self._vids[file_idx]
-            mask_arr = self._load_mask_for_vid(vid)
-            if mask_arr is not None and mask_arr.shape[0] > 0:
-                frame_indices = data.get("frame_indices")
-                if frame_indices is not None:
-                    fidx = int(frame_indices[local_idx])
-                    if vid not in self._mask_offset:
-                        min_idx = int(np.min(frame_indices))
-                        max_idx = int(np.max(frame_indices))
-                        mask_len = int(mask_arr.shape[0])
-                        if max_idx == mask_len and min_idx >= 1:
-                            self._mask_offset[vid] = -1
-                        elif max_idx >= mask_len:
-                            self._mask_offset[vid] = -1
-                        else:
-                            self._mask_offset[vid] = 0
-                    fidx += self._mask_offset.get(vid, 0)
-                else:
+            frame_labels = self._load_frame_labels_for_vid(vid)
+            if self.pixel_eval:
+                mask_arr = self._load_mask_for_vid(vid)
+            mask_len = None
+            if frame_labels is not None:
+                mask_len = int(len(frame_labels))
+            elif mask_arr is not None:
+                mask_len = int(mask_arr.shape[0])
+            if mask_len is not None:
+                count = int(self._counts[file_idx])
+                if mask_len == count:
                     fidx = local_idx
-                fidx = max(0, min(fidx, int(mask_arr.shape[0]) - 1))
+                else:
+                    frame_indices = data.get("frame_indices")
+                    if frame_indices is not None:
+                        frame_indices = np.asarray(frame_indices)
+                        fidx = int(frame_indices[local_idx])
+                        if vid not in self._mask_offset:
+                            min_idx = int(np.min(frame_indices))
+                            max_idx = int(np.max(frame_indices))
+                            if max_idx == mask_len and min_idx >= 1:
+                                self._mask_offset[vid] = -1
+                            elif max_idx >= mask_len:
+                                self._mask_offset[vid] = -1
+                            else:
+                                self._mask_offset[vid] = 0
+                        fidx += self._mask_offset.get(vid, 0)
+                    else:
+                        fidx = local_idx
+                fidx = max(0, min(fidx, mask_len - 1))
+            if frame_labels is not None and fidx is not None:
+                label = int(frame_labels[fidx])
+        if self.pixel_eval:
+            if mask_arr is not None and mask_arr.shape[0] > 0 and fidx is not None:
                 m = mask_arr[fidx]
                 m = (m > 0).astype(np.uint8)
                 if m.shape[0] != self.c.input_size[0] or m.shape[1] != self.c.input_size[1]:
