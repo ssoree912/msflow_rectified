@@ -1,6 +1,7 @@
 import os
 import re
 import bisect
+import json
 from PIL import Image
 import numpy as np
 import torch
@@ -179,7 +180,7 @@ class VisADataset(Dataset):
 
 
 
-MSTC_CLASS_NAMES = ['campus']  # single “class” placeholder
+MSTC_CLASS_NAMES = ['shanghaitech']  # single class placeholder
 
 class MSTCDataset(Dataset):
     """
@@ -344,17 +345,60 @@ class MSTCFeatureDataset(Dataset):
         self._counts = []
         self._cache_idx = None
         self._cache_data = None
+        self._suffix = suffix
+        manifest_path = os.path.join(self.feature_dir, 'manifest.json')
+        video_counts = {}
+        stage_channels = None
+        stage_shapes = None
+        if os.path.isfile(manifest_path):
+            try:
+                with open(manifest_path, 'r') as f:
+                    manifest = json.load(f)
+                video_counts = manifest.get('video_counts', {}) or {}
+                stage_channels = manifest.get('stage_channels')
+                stage_shapes = manifest.get('stage_shapes')
+            except Exception:
+                video_counts = {}
+
+        if stage_channels and stage_shapes:
+            self.output_channels = [int(x) for x in stage_channels]
+            self.stage_hw = [(int(h), int(w)) for h, w in stage_shapes]
+        else:
+            data = np.load(self.files[0], allow_pickle=True).item()
+            self._cache_idx = 0
+            self._cache_data = data
+            s1, s2, s3 = data["s1"], data["s2"], data["s3"]
+            self.output_channels = [s1.shape[1], s2.shape[1], s3.shape[1]]
+            self.stage_hw = [(s1.shape[2], s1.shape[3]),
+                             (s2.shape[2], s2.shape[3]),
+                             (s3.shape[2], s3.shape[3])]
+
+        missing_counts = 0
+        for fpath in self.files:
+            vid = os.path.basename(fpath)
+            if vid.endswith(suffix):
+                vid = vid[:-len(suffix)]
+            if vid not in video_counts:
+                missing_counts += 1
+        if missing_counts:
+            print(f"[FeatureCache] indexing {missing_counts} feature files (this may take a while)")
+
+        scanned = 0
         for i, fpath in enumerate(self.files):
-            data = np.load(fpath, allow_pickle=True).item()
-            if i == 0:
-                self._cache_idx = 0
-                self._cache_data = data
-                s1, s2, s3 = data["s1"], data["s2"], data["s3"]
-                self.output_channels = [s1.shape[1], s2.shape[1], s3.shape[1]]
-                self.stage_hw = [(s1.shape[2], s1.shape[3]),
-                                 (s2.shape[2], s2.shape[3]),
-                                 (s3.shape[2], s3.shape[3])]
-            self._counts.append(int(data["s1"].shape[0]))
+            vid = os.path.basename(fpath)
+            if vid.endswith(suffix):
+                vid = vid[:-len(suffix)]
+            count = video_counts.get(vid)
+            if count is None:
+                if i == 0 and self._cache_data is not None:
+                    data = self._cache_data
+                else:
+                    data = np.load(fpath, allow_pickle=True).item()
+                count = int(data["s1"].shape[0])
+                scanned += 1
+                if scanned % 50 == 0:
+                    print(f"[FeatureCache] indexed {scanned}/{missing_counts} files")
+            self._counts.append(int(count))
         self._cum_counts = np.cumsum(self._counts)
         self._feature_fp32 = getattr(c, "feature_fp32", True)
 

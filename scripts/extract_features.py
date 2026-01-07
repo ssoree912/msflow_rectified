@@ -3,6 +3,7 @@ import argparse
 import json
 import os
 import re
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,10 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import default as default_cfg
 from datasets import MVTecDataset, VisADataset, MSTCDataset
 from datasets import MVTEC_CLASS_NAMES, VISA_CLASS_NAMES, MSTC_CLASS_NAMES
@@ -20,16 +25,20 @@ from pruning.utils import apply_pruning_mask, resolve_pruning_mode, extractor_fo
 
 
 class IndexedDataset(Dataset):
-    def __init__(self, base):
+    def __init__(self, base, indices=None):
         self.base = base
+        self.indices = indices
         self.x = getattr(base, "x", None)
 
     def __len__(self):
+        if self.indices is not None:
+            return len(self.indices)
         return len(self.base)
 
     def __getitem__(self, idx):
-        x, y, _ = self.base[idx]
-        return x, y, idx
+        real_idx = self.indices[idx] if self.indices is not None else idx
+        x, y, _ = self.base[real_idx]
+        return x, y, real_idx
 
 
 def parse_args():
@@ -49,6 +58,8 @@ def parse_args():
                         help="use np.savez_compressed for npz output")
     parser.add_argument("--video-suffix", default="_res.npy",
                         help="suffix for --video-format npy (default: _res.npy)")
+    parser.add_argument("--skip-existing", action="store_true", default=False,
+                        help="skip videos with existing cached files (by-video + npy/npz)")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--extractor", default=default_cfg.extractor)
@@ -58,6 +69,8 @@ def parse_args():
     parser.add_argument("--chunk-size", type=int, default=32)
     parser.add_argument("--amp", action="store_true", default=False)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--log-interval", type=int, default=50,
+                        help="log progress every N batches")
     parser.add_argument("--pixel-eval", action="store_true", default=False,
                         help="load pixel masks if dataset supports it (slower)")
     parser.add_argument("--pruning-mode", default=default_cfg.pruning_mode,
@@ -182,6 +195,16 @@ def parse_frame_index(path):
     return 0
 
 
+def format_seconds(seconds):
+    seconds = int(seconds)
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h > 0:
+        return f"{h:d}:{m:02d}:{s:02d}"
+    return f"{m:d}:{s:02d}"
+
+
 def flush_video_npz(out_dir, vid, feats_accum, labels_accum, paths_accum, frame_idx_accum, compress):
     if not labels_accum:
         return 0
@@ -237,14 +260,7 @@ def flush_video_npy(out_dir, vid, feats_accum, labels_accum, paths_accum, frame_
 
 def extract_split(cfg, args, split):
     is_train = split == "train"
-    dataset = get_dataset(cfg, is_train=is_train)
-    loader = DataLoader(
-        IndexedDataset(dataset),
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.workers,
-        pin_memory=True,
-    )
+    base_dataset = get_dataset(cfg, is_train=is_train)
 
     extractor, _ = build_extractor(cfg)
     apply_pruning_mask(extractor, cfg.pruning_sparsity)
@@ -262,6 +278,45 @@ def extract_split(cfg, args, split):
     else:
         out_dir = Path(args.save_dir) / split_dir / args.save_subdir
         out_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = out_dir / "manifest.json"
+    prev_counts = {}
+    if manifest_path.exists():
+        try:
+            with open(manifest_path, "r") as f:
+                prev_manifest = json.load(f)
+            prev_counts = prev_manifest.get("video_counts", {}) or {}
+        except Exception:
+            prev_counts = {}
+    skip_videos = set()
+    indices = None
+    if args.skip_existing and args.layout == "by-video" and args.video_format in ("npy", "npz"):
+        if not getattr(base_dataset, "x", None):
+            raise ValueError("--skip-existing requires dataset with file paths")
+        vids = sorted({os.path.basename(os.path.dirname(p)) for p in base_dataset.x})
+        for vid in vids:
+            if args.video_format == "npy":
+                out_path = out_dir / f"{vid}{args.video_suffix}"
+            else:
+                out_path = out_dir / vid / "features.npz"
+            if out_path.exists():
+                skip_videos.add(vid)
+        if skip_videos:
+            indices = [
+                i for i, p in enumerate(base_dataset.x)
+                if os.path.basename(os.path.dirname(p)) not in skip_videos
+            ]
+            if not indices:
+                print(f"[{cfg.dataset}/{cfg.class_name}/{split}] all videos already cached; skipping.")
+                return
+
+    dataset = IndexedDataset(base_dataset, indices=indices)
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.workers,
+        pin_memory=True,
+    )
 
     feats_accum = [[], [], []]
     labels_accum = []
@@ -271,11 +326,17 @@ def extract_split(cfg, args, split):
     vid_chunk_idx = {}
     vid_seen = set()
     current_vid = None
+    video_counts = dict(prev_counts)
     total = 0
     stage_shapes = None
+    stage_channels = None
     start = time.time()
+    seen = 0
+    total_samples = len(dataset)
+    total_batches = len(loader)
+    log_interval = max(1, args.log_interval)
 
-    for batch in loader:
+    for idx, batch in enumerate(loader):
         images, labels, indices = batch
         images = images.to(cfg.device, non_blocking=True)
         labels = labels.to(torch.uint8)
@@ -290,11 +351,25 @@ def extract_split(cfg, args, split):
             feats = [pool_layer(f) for f in feats]
             if stage_shapes is None:
                 stage_shapes = [list(f.shape[1:]) for f in feats]
+                stage_channels = [int(f.shape[1]) for f in feats]
 
         feats_cpu = [f.detach().to("cpu", dtype=save_dtype) for f in feats]
         labels_cpu = labels.cpu()
+        seen += labels_cpu.shape[0]
         idx_list = indices.tolist()
         paths = [dataset.x[i] for i in idx_list]
+
+        if (idx == 0) or ((idx + 1) % log_interval == 0) or ((idx + 1) == total_batches):
+            elapsed = time.time() - start
+            rate = seen / elapsed if elapsed > 0 else 0.0
+            remain = total_samples - seen
+            eta = format_seconds(remain / rate) if rate > 0 else "?:??"
+            pct = (100.0 * seen / total_samples) if total_samples else 0.0
+            print(
+                f"[{cfg.dataset}/{cfg.class_name}/{split}] "
+                f"{seen}/{total_samples} ({pct:.1f}%) "
+                f"{rate:.1f} samples/s ETA {eta}"
+            )
 
         if args.layout == "flat":
             feats_accum[0].append(feats_cpu[0])
@@ -316,9 +391,13 @@ def extract_split(cfg, args, split):
                 current_vid = vid
             if vid != current_vid:
                 if args.video_format == "npz":
-                    total += flush_video_npz(out_dir, current_vid, feats_accum, labels_accum, paths_accum, frame_idx_accum, args.npz_compress)
+                    count = flush_video_npz(out_dir, current_vid, feats_accum, labels_accum, paths_accum, frame_idx_accum, args.npz_compress)
+                    total += count
+                    video_counts[current_vid] = count
                 elif args.video_format == "npy":
-                    total += flush_video_npy(out_dir, current_vid, feats_accum, labels_accum, paths_accum, frame_idx_accum, args.video_suffix)
+                    count = flush_video_npy(out_dir, current_vid, feats_accum, labels_accum, paths_accum, frame_idx_accum, args.video_suffix)
+                    total += count
+                    video_counts[current_vid] = count
                 else:
                     vdir = out_dir / current_vid
                     vdir.mkdir(parents=True, exist_ok=True)
@@ -347,9 +426,13 @@ def extract_split(cfg, args, split):
                 current_vid = vid
             if vid != current_vid:
                 if args.video_format == "npz":
-                    total += flush_video_npz(out_dir, current_vid, feats_accum, labels_accum, paths_accum, frame_idx_accum, args.npz_compress)
+                    count = flush_video_npz(out_dir, current_vid, feats_accum, labels_accum, paths_accum, frame_idx_accum, args.npz_compress)
+                    total += count
+                    video_counts[current_vid] = count
                 elif args.video_format == "npy":
-                    total += flush_video_npy(out_dir, current_vid, feats_accum, labels_accum, paths_accum, frame_idx_accum, args.video_suffix)
+                    count = flush_video_npy(out_dir, current_vid, feats_accum, labels_accum, paths_accum, frame_idx_accum, args.video_suffix)
+                    total += count
+                    video_counts[current_vid] = count
                 else:
                     vdir = out_dir / current_vid
                     vdir.mkdir(parents=True, exist_ok=True)
@@ -377,9 +460,13 @@ def extract_split(cfg, args, split):
     else:
         if current_vid is not None and labels_accum:
             if args.video_format == "npz":
-                total += flush_video_npz(out_dir, current_vid, feats_accum, labels_accum, paths_accum, frame_idx_accum, args.npz_compress)
+                count = flush_video_npz(out_dir, current_vid, feats_accum, labels_accum, paths_accum, frame_idx_accum, args.npz_compress)
+                total += count
+                video_counts[current_vid] = count
             elif args.video_format == "npy":
-                total += flush_video_npy(out_dir, current_vid, feats_accum, labels_accum, paths_accum, frame_idx_accum, args.video_suffix)
+                count = flush_video_npy(out_dir, current_vid, feats_accum, labels_accum, paths_accum, frame_idx_accum, args.video_suffix)
+                total += count
+                video_counts[current_vid] = count
             else:
                 vdir = out_dir / current_vid
                 vdir.mkdir(parents=True, exist_ok=True)
@@ -397,6 +484,7 @@ def extract_split(cfg, args, split):
         "extractor": cfg.extractor,
         "save_dtype": args.save_dtype,
         "stage_shapes": stage_shapes,
+        "stage_channels": stage_channels,
         "chunk_size": args.chunk_size,
     }
     manifest["layout"] = args.layout
@@ -406,11 +494,17 @@ def extract_split(cfg, args, split):
     if args.layout == "by-video":
         manifest["save_subdir"] = args.save_subdir
         manifest["video_ids"] = sorted(vid_seen)
+        if video_counts:
+            manifest["video_counts"] = video_counts
+        if skip_videos:
+            manifest["skipped_videos"] = sorted(skip_videos)
+            manifest["skipped_count"] = len(skip_videos)
     manifest_path = out_dir / "manifest.json"
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)
 
-    print(f"[{cfg.dataset}/{cfg.class_name}/{split}] saved {total} samples in {elapsed:.1f}s -> {out_dir}")
+    skip_note = f", skipped {len(skip_videos)} videos" if skip_videos else ""
+    print(f"[{cfg.dataset}/{cfg.class_name}/{split}] saved {total} samples in {elapsed:.1f}s -> {out_dir}{skip_note}")
 
 
 def main():

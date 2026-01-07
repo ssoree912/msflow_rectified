@@ -33,6 +33,8 @@ def parsing_args(c):
                         help='learning rate')
     parser.add_argument('--batch-size', default=8, type=int, 
                         help='train batch size')
+    parser.add_argument('--workers', default=c.workers, type=int,
+                        help='num dataloader workers')
     parser.add_argument('--meta-epochs', default=25, type=int,
                         help='number of meta epochs to train')
     parser.add_argument('--sub-epochs', default=4, type=int,
@@ -108,7 +110,7 @@ def parsing_args(c):
     elif c.dataset == 'mstc':
         from datasets import MSTC_CLASS_NAMES
         setattr(c, 'data_path', './data/shanghaitech')
-        # mSTC isn’t multi-class; use one placeholder “campus”
+        # mSTC isn’t multi-class; use one placeholder “shanghaitech”
         setattr(c, 'class_names', MSTC_CLASS_NAMES)
         
     if c.dataset == 'mvtec':
