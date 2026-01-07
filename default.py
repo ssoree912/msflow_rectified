@@ -27,6 +27,7 @@ dataset = 'mvtec' # [mvtec, visa]
 class_name = 'zipper'
 input_size = (512, 512)
 img_mean, img_std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
+mstc_frame_stride = 5
 
 # model
 extractor = 'wide_resnet50_2' # [resnet18, resnet34, resnet50, resnext50_32x4d, wide_resnet50_2]

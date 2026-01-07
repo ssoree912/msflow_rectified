@@ -88,6 +88,8 @@ def parse_args():
     parser.add_argument("--dwa-beta", type=float, default=default_cfg.dwa_beta)
     parser.add_argument("--dwa-update-threshold", action="store_true", default=default_cfg.dwa_update_threshold)
     parser.add_argument("--dwa-threshold-percentile", type=int, default=default_cfg.dwa_threshold_percentile)
+    parser.add_argument("--mstc-frame-stride", type=int, default=getattr(default_cfg, "mstc_frame_stride", 1),
+                        help="frame stride for mstc (every Nth frame)")
     return parser.parse_args()
 
 
@@ -136,6 +138,7 @@ def build_cfg(args, class_name):
     cfg.dwa_update_threshold = args.dwa_update_threshold
     cfg.dwa_threshold_percentile = args.dwa_threshold_percentile
     cfg.pruning_type_value, cfg.pruning_forward_type = resolve_pruning_mode(cfg.pruning_mode)
+    cfg.mstc_frame_stride = max(1, int(getattr(args, "mstc_frame_stride", 1)))
 
     cfg.device = torch.device(args.device)
     return cfg
@@ -487,6 +490,8 @@ def extract_split(cfg, args, split):
         "stage_channels": stage_channels,
         "chunk_size": args.chunk_size,
     }
+    if cfg.dataset == "mstc":
+        manifest["mstc_frame_stride"] = cfg.mstc_frame_stride
     manifest["layout"] = args.layout
     manifest["video_format"] = args.video_format
     manifest["npz_compress"] = args.npz_compress

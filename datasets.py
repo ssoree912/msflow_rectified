@@ -208,6 +208,7 @@ class MSTCDataset(Dataset):
 
         split_dir = 'training' if is_train else 'testing'
         self.frames_dir = os.path.join(self.root, split_dir, 'frames')
+        self.frame_stride = max(1, int(getattr(c, 'mstc_frame_stride', 1)))
 
         # gather all frame paths: frames/<vid_id>/*.jpg
         vid_ids = [d for d in sorted(os.listdir(self.frames_dir)) if os.path.isdir(os.path.join(self.frames_dir, d))]
@@ -215,10 +216,16 @@ class MSTCDataset(Dataset):
         for vid in vid_ids:
             vid_dir = os.path.join(self.frames_dir, vid)
             # jpgs may be 0.jpg.. or 000.jpg.. — sort lexicographically works with zero-padding
-            for fname in sorted(os.listdir(vid_dir)):
+            files = [
+                f for f in sorted(os.listdir(vid_dir))
+                if os.path.isfile(os.path.join(vid_dir, f))
+                and os.path.splitext(f)[1].lower() in {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff'}
+            ]
+            if self.frame_stride > 1:
+                files = files[::self.frame_stride]
+            for fname in files:
                 p = os.path.join(vid_dir, fname)
-                if os.path.isfile(p) and os.path.splitext(p)[1].lower() in {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff'}:
-                    frame_paths.append(p)
+                frame_paths.append(p)
 
         self.x = frame_paths
         self.y = [0] * len(self.x)   # filled for test below
