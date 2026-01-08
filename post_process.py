@@ -1,3 +1,4 @@
+import datetime
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -13,17 +14,36 @@ def post_process(c, size_list, outputs_list):
         target_size = c.input_size
     logp_maps = [list() for _ in size_list]
     prop_maps = [list() for _ in size_list]
+    log_interval = max(1, int(getattr(c, "log_interval", 50)))
     for l, outputs in enumerate(outputs_list):
-        # output = torch.tensor(output, dtype=torch.double)
-        outputs = torch.cat(outputs, 0)
-        if outputs.dtype == torch.float16:
-            outputs = outputs.float()
-        logp_maps[l] = F.interpolate(outputs.unsqueeze(1),
-                size=target_size, mode='bilinear', align_corners=True).squeeze(1)
-        output_norm = outputs - outputs.max(-1, keepdim=True)[0].max(-2, keepdim=True)[0]
-        prob_map = torch.exp(output_norm) # convert to probs in range [0:1]
-        prop_maps[l] = F.interpolate(prob_map.unsqueeze(1),
-                size=target_size, mode='bilinear', align_corners=True).squeeze(1)
+        if not outputs:
+            logp_maps[l] = torch.empty((0, *target_size))
+            prop_maps[l] = torch.empty((0, *target_size))
+            continue
+        total = sum(int(o.shape[0]) for o in outputs)
+        processed = 0
+        logp_chunks = []
+        prop_chunks = []
+        for i, out in enumerate(outputs):
+            if out.dtype == torch.float16:
+                out = out.float()
+            logp = F.interpolate(out.unsqueeze(1),
+                    size=target_size, mode='bilinear', align_corners=True).squeeze(1)
+            output_norm = out - out.max(-1, keepdim=True)[0].max(-2, keepdim=True)[0]
+            prob_map = torch.exp(output_norm) # convert to probs in range [0:1]
+            prop = F.interpolate(prob_map.unsqueeze(1),
+                    size=target_size, mode='bilinear', align_corners=True).squeeze(1)
+            logp_chunks.append(logp)
+            prop_chunks.append(prop)
+            processed += int(out.shape[0])
+            if log_interval and ((i == 0) or ((i + 1) % log_interval == 0) or processed == total):
+                pct = 100.0 * processed / total if total else 100.0
+                print(
+                    datetime.datetime.now().strftime("[%Y-%m-%d-%H:%M:%S]"),
+                    f"[PostProcess] level {l+1}/{len(outputs_list)} {processed}/{total} ({pct:.1f}%)"
+                )
+        logp_maps[l] = torch.cat(logp_chunks, 0)
+        prop_maps[l] = torch.cat(prop_chunks, 0)
     
     logp_map = sum(logp_maps)
     logp_map-= logp_map.max(-1, keepdim=True)[0].max(-2, keepdim=True)[0]
