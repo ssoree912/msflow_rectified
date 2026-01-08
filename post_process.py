@@ -16,6 +16,8 @@ def post_process(c, size_list, outputs_list):
     for l, outputs in enumerate(outputs_list):
         # output = torch.tensor(output, dtype=torch.double)
         outputs = torch.cat(outputs, 0)
+        if outputs.dtype == torch.float16:
+            outputs = outputs.float()
         logp_maps[l] = F.interpolate(outputs.unsqueeze(1),
                 size=target_size, mode='bilinear', align_corners=True).squeeze(1)
         output_norm = outputs - outputs.max(-1, keepdim=True)[0].max(-2, keepdim=True)[0]
